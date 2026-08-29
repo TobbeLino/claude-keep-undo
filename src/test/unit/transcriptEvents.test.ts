@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   editEventFor,
@@ -268,16 +269,18 @@ describe("parseTranscriptLine: file-history records", () => {
         backup: {
           backupFileName: "a242946403ba6fa0@v1",
           version: 1,
-          realParentDir: "/repo/src",
+          realParentDir: path.join(path.sep, "repo", "src"),
         },
         timestamp: "2026-07-13T14:51:02.847Z",
       })
     );
     assert.ok(parsed);
     assert.equal(parsed.backups.length, 1);
+    // Composed with `path.join`, so the expectation has to be too: on Windows the
+    // same inputs produce `\repo\src\app.ts`, which is correct there.
     assert.deepEqual(parsed.backups[0], {
       kind: "content",
-      path: "/repo/src/app.ts",
+      path: path.join(path.sep, "repo", "src", "app.ts"),
       name: "a242946403ba6fa0@v1",
       ts: Date.parse("2026-07-13T14:51:02.847Z"),
     });

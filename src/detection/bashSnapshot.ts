@@ -367,7 +367,13 @@ export function looksReadOnly(command: unknown): boolean {
       return false;
     }
     head = head.replace(/^\\/, "");
-    const base = head.slice(head.lastIndexOf("/") + 1);
+    // Both separators: a command may be spelled `/usr/bin/ls` or `C:\tools\ls`.
+    // Failing to strip one only ever means the name is not recognised, so the
+    // command is not skipped — the safe direction — but there is no reason to
+    // leave the gate ineffective on Windows.
+    const base = head.slice(
+      Math.max(head.lastIndexOf("/"), head.lastIndexOf("\\")) + 1
+    );
     if (base === "git") {
       const sub = words.slice(at + 1).find((w) => !w.startsWith("-"));
       if (!sub || !READ_ONLY_GIT.has(sub)) {
