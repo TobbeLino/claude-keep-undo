@@ -255,3 +255,76 @@ describe("trustWriteSnapshot", () => {
     assert.match(verdict.kind === "reject" ? verdict.reason : "", /outlived/);
   });
 });
+
+describe("parseTranscriptLine: file-history records", () => {
+  it("reads a backup announcement, which has no message at all", () => {
+    // The parser used to return as soon as `message.content` was not an array,
+    // and a file-history record has no `message` — so the single most faithful
+    // baseline available anywhere was discarded on every line that carried one.
+    const parsed = parseTranscriptLine(
+      JSON.stringify({
+        type: "file-history-delta",
+        trackingPath: "src/app.ts",
+        backup: {
+          backupFileName: "a242946403ba6fa0@v1",
+          version: 1,
+          realParentDir: "/repo/src",
+        },
+        timestamp: "2026-07-13T14:51:02.847Z",
+      })
+    );
+    assert.ok(parsed);
+    assert.equal(parsed.backups.length, 1);
+    assert.deepEqual(parsed.backups[0], {
+      kind: "content",
+      path: "/repo/src/app.ts",
+      name: "a242946403ba6fa0@v1",
+      ts: Date.parse("2026-07-13T14:51:02.847Z"),
+    });
+    assert.deepEqual(parsed.uses, []);
+    assert.deepEqual(parsed.results, []);
+  });
+
+  it("leaves an ordinary line's backups empty", () => {
+    const parsed = parseTranscriptLine(
+      assistantLine([{ type: "text", text: "hello" }])
+    );
+    assert.ok(parsed);
+    assert.deepEqual(parsed.backups, []);
+  });
+});
+
+describe("filePathOf: notebooks", () => {
+  it("reads a NotebookEdit's notebook_path", () => {
+    // Its absence dropped every notebook edit before any other decision.
+    assert.equal(
+      filePathOf({ notebook_path: "/repo/analysis.ipynb" }),
+      "/repo/analysis.ipynb"
+    );
+  });
+
+  it("still prefers file_path when both are present", () => {
+    assert.equal(
+      filePathOf({ file_path: "/a.ts", notebook_path: "/b.ipynb" }),
+      "/a.ts"
+    );
+  });
+});
+
+describe("editEventFor: NotebookEdit", () => {
+  it("treats a cell edit as a whole-file write", () => {
+    // `new_source` is one cell's source; the file on disk wraps it in JSON with
+    // its own escaping and `outputs`. Modelling it as a string edit would hand
+    // reverseApply an `old_string` that does not occur in the file — or, worse,
+    // one that occurs by coincidence. As a write it takes the retrieval path.
+    assert.deepEqual(
+      editEventFor("NotebookEdit", {
+        notebook_path: "/repo/a.ipynb",
+        cell_id: "c1",
+        new_source: "print(1)",
+        edit_mode: "replace",
+      }),
+      { kind: "write" }
+    );
+  });
+});

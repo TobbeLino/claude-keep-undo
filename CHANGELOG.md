@@ -5,6 +5,112 @@ All notable changes to **Keep / Undo for Claude Code** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0]
+
+### Added — files Claude changes by running a shell command
+
+Claude does not only use its edit tools: it runs `sed -i`, redirects into a file,
+moves and deletes things, runs a formatter or a code generator. None of that was
+detected, and it is not a rare case — measured across a full transcript history,
+Claude Code issues roughly **twelve Bash calls for every edit-tool call**.
+
+- **Those changes are now reviewed like any other.** A file the command created
+  can be undone away; one it modified is restored to what it held beforehand.
+- **Git is what makes it exact**, and what makes it affordable: `git status`
+  costs O(tracked files) where walking the tree costs O(tree) — 23 ms against
+  708 ms on a real 69,000-file checkout, and the walk would not have said what
+  the files used to hold anyway. Before the command, one `git status` records the
+  commit being compared against and the handful of files that already differ from
+  it; those are copied aside. After it, a second `git status` says what changed,
+  and every changed file either gets a byte-exact baseline or is listed as *not
+  reviewable* with the reason.
+- **Recovery uses `git cat-file --filters`, never the raw object.** In a
+  repository with `text=auto eol=crlf` the stored object has LF endings while the
+  working file has CRLF, so an Undo built from the raw blob would rewrite every
+  line in the file.
+- **A new setting, `claudeKeepUndo.detection.bashChanges`.** The default, *files
+  it creates*, reads no pre-existing file at all — the baseline of a file that
+  did not exist is not a guess — so that tier cannot record a wrong one by
+  construction. *Files it creates and modifies* additionally copies
+  already-modified files aside before each command. Changing it re-registers the
+  hooks by itself.
+- **Commands that cannot write are skipped** without taking a snapshot. The list
+  of such commands is deliberately tiny, and it was checked against 27,109
+  recorded commands: none that writes is on it.
+- **Deliberately not covered**, rather than covered badly: a command run in the
+  background finishes after the hook has already sampled the filesystem, so
+  nothing is recorded instead of an arbitrary half.
+- **It needs a Git repository, and says so when there is not one.** Outside a
+  repository, or with Git missing from the `PATH`, shell-command changes are not
+  detected — and the extension now warns once, with the option to switch the
+  feature off, instead of leaving the review queue quietly empty. Claude's
+  ordinary edit tools are unaffected either way.
+
+### Added — detection reaches further without the hooks
+
+- **Claude Code's own pre-edit copies are used as baselines.** Before it edits a
+  file, Claude Code copies the original under `~/.claude/file-history/` and names
+  the copy in the session transcript. Those records were parsed as nothing and
+  dropped; they are now read, and the copy is used directly. This is a retrieval
+  rather than a replay, so it is subject to none of the reasons reverse-applying
+  an edit list has to refuse — a `replace_all`, an ambiguous anchor, a deletion
+  with no surviving anchor — and none of its one silent failure, where an edit
+  that never reached the extension yields a baseline that verifies and is still
+  wrong.
+- **A file Claude Code created is now recognised as created, not inferred.** When
+  it records no copy it is because the file did not exist, which replaces a
+  timing heuristic — the file's modification time having to predate the tool
+  call — that could not decide the question when the transcript was read late.
+- **Transcripts written by subagents are read.** The sweep was flat, so anything
+  a Task or a workflow agent changed was invisible: those transcripts live one to
+  three levels below the session directory and their tool calls are not mirrored
+  into the parent. On the development machine this was thirty times more
+  transcript files than the sweep had been reading.
+- **`NotebookEdit` is detected.** It names its target `notebook_path`, which no
+  part of the extension looked at, so every notebook edit was dropped before any
+  other decision was reached. It is treated as a whole-file write rather than as
+  a cell edit, because the cell source in the tool call is not what is on disk.
+
+### Fixed — three ways a wrong baseline could be recorded
+
+- **A transcript line larger than the read window is no longer skipped.** The
+  window now stretches to hold it. A skipped line was the one failure
+  reconstruction cannot survive: if it carried an edit's announcement while the
+  matching result was seen, the baseline was rebuilt from a subset — and
+  replaying a subset forward reproduces the file exactly, so the check that is
+  supposed to catch a bad baseline passes. 92 lines in a real transcript history
+  exceed the old window. Past the largest window worth holding, the affected
+  files are now listed with the reason rather than reconstructed.
+- **Session directories are identified by the working directory they record**,
+  not by deriving a folder name from the workspace root. That derivation replaced
+  every non-alphanumeric character with a dash, so it was neither injective — two
+  different projects could share a folder, and one project's edits could be
+  attributed to the other — nor complete: a session started from a subdirectory
+  of the workspace wrote somewhere the extension never looked, and was missed
+  entirely and silently.
+- **A relative path in a tool call is resolved against the working directory that
+  call recorded**, not the workspace root. A shell `cd` persists across calls, so
+  the two diverge within a single session; resolving against the wrong one would
+  record the baseline onto a different file. Where no working directory is
+  recorded the call is skipped rather than guessed at.
+- **Attaching to a transcript mid-session no longer discards the next record.**
+  The offset is now checked for being a line boundary instead of assumed not to
+  be one.
+
+### Added — MCP tools that write files
+
+- A file changed by an MCP tool is listed with an explanation instead of being
+  missed. Nothing is reconstructed — an MCP server's edit semantics are its own —
+  and the decision is made from the tool's name, so a tool that only read a file
+  never appears as one that changed it.
+
+### Housekeeping
+
+- Expired stagings, old recovery snapshots and finished command slots are now
+  swept on a timer. A window left open for a week previously pruned nothing, and
+  an expired staging is not merely clutter: it is a verbatim copy of a source
+  file, and one a later capture could have promoted as an original it never was.
+
 ## [1.1.0]
 
 ### Added — files the extension leaves alone

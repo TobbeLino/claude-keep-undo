@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { SECTION, SettingValue, findSetting } from "./settingsSchema";
+import { BashMode } from "./detection/bashSnapshot";
 
 export { SECTION } from "./settingsSchema";
 
@@ -141,6 +142,18 @@ export function statusBarMessage(): boolean {
 
 export function useHooks(): boolean {
   return raw<boolean>("detection.useHooks");
+}
+
+/**
+ * How much of what a shell command changed is captured. See settingsSchema.ts
+ * for what each tier guarantees; `BashMode` is the same three values, named
+ * where the hook and the pure logic can both see them.
+ */
+export function bashChanges(): BashMode {
+  const value = raw<string>("detection.bashChanges");
+  return value === "off" || value === "recover" || value === "created"
+    ? value
+    : "created";
 }
 
 export function useTranscript(): boolean {

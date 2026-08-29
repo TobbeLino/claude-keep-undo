@@ -20,6 +20,7 @@
  * This script must never block a tool call: it always exits 0 and swallows
  * errors, so a problem here can never interfere with Claude Code.
  */
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -36,6 +37,22 @@ const PENDING_TTL_MS = 60_000;
 
 /** The event log is a diagnostic, not a record: cap it rather than grow forever. */
 const EVENTS_MAX_BYTES = 256 * 1024;
+
+/**
+ * Ceilings for the Bash path.
+ *
+ * These are constants rather than settings on purpose: they exist to stop a
+ * pathological repository from making the hook slow or the state directory
+ * large, not to be tuned. Every one of them degrades to "the file is listed with
+ * an explanation", never to a guess.
+ */
+const BASH_MAX_STAGED = 200;
+const BASH_MAX_STAGED_BYTES = 32 * 1024 * 1024;
+const BASH_MAX_FILE_BYTES = 4 * 1024 * 1024;
+const BASH_MAX_CANDIDATES = 500;
+const BASH_MAX_RECOVER = 200;
+/** git is fast, but it must never be the reason a shell command is held up. */
+const GIT_TIMEOUT_MS = 10_000;
 
 const argv = process.argv.slice(2);
 const mode = argv[0] === "post" ? "post" : "pre";
@@ -132,13 +149,20 @@ function atomicWrite(target, content) {
  * baseline that is not a byte-exact copy of what was captured can never reach an
  * Undo. Must stay in sync with `Sidecar` in the extension's util.ts.
  */
-function writeSidecar(contentPath, absPath, created, bytes) {
+function writeSidecar(contentPath, absPath, created, bytes, ttlMs) {
   const record = { path: absPath, ts: Date.now(), created: created === true };
   // Omitted rather than guessed when it is not known: the extension reads a
   // missing `bytes` as "written by an older version" and falls back to its
   // heuristic, whereas a wrong number would demote a perfectly good baseline.
   if (typeof bytes === "number") {
     record.bytes = bytes;
+  }
+  // Only Bash stagings carry one. A shell command may legitimately run for
+  // minutes — the tool's default timeout alone is double the global staging
+  // TTL — so its copy has to outlive that TTL. An Edit staging records none and
+  // keeps exactly the behaviour it always had.
+  if (typeof ttlMs === "number") {
+    record.ttlMs = ttlMs;
   }
   atomicWrite(`${contentPath}.json`, JSON.stringify(record, null, 2));
 }
@@ -258,6 +282,76 @@ function loadIgnoreRules(stateDir, fallbackRoot) {
   return rules.isEmpty ? { status: "none" } : { status: "ok", root, rules };
 }
 
+/**
+ * Run git, and never throw.
+ *
+ * `missingPath` is the signal that a path is absent from a commit: `cat-file`
+ * exits 128 with "does not exist in". That is what proves a file was *created*,
+ * and it must stay distinguishable from every other failure — reading it as an
+ * empty baseline would have Undo delete a file that existed.
+ */
+function git(cwd, args, stdin, raw = false) {
+  try {
+    const res = spawnSync("git", args, {
+      cwd,
+      input: stdin,
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      encoding: raw ? "buffer" : "utf8",
+    });
+    if (res.error) {
+      return { ok: false, missingPath: false };
+    }
+    const stderr = raw
+      ? String(res.stderr ?? "")
+      : (res.stderr ?? "").toString();
+    const missingPath =
+      res.status === 128 && /does not exist in|exists on disk, but not in/.test(stderr);
+    if (res.status !== 0) {
+      return { ok: false, missingPath };
+    }
+    return raw
+      ? { ok: true, missingPath: false, buf: res.stdout }
+      : { ok: true, missingPath: false, text: res.stdout ?? "" };
+  } catch {
+    return { ok: false, missingPath: false };
+  }
+}
+
+/**
+ * The pure decision logic, loaded from the extension's own build output for the
+ * same reason the ignore matcher is: one implementation, and a hook that cannot
+ * disagree with the extension about what a status record means. If it will not
+ * load, the Bash path does nothing at all — it must never fall back to a
+ * hand-rolled parser.
+ */
+function loadBashSnapshot() {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    return createRequire(import.meta.url)(
+      path.join(here, "..", "out", "detection", "bashSnapshot.js")
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function sha256(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function sha1Hex(value) {
+  return crypto.createHash("sha1").update(value).digest("hex");
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 function remove(target) {
   try {
     fs.rmSync(target, { force: true });
@@ -292,6 +386,465 @@ function appendEvent(eventsPath, event) {
   }
 }
 
+/**
+ * The git toplevel for the workspace, cached because it never changes and a
+ * process spawn costs ~9 ms on every single Bash call.
+ */
+function gitToplevel(ctx) {
+  const cacheFile = path.join(ctx.stateDir, "bash", "repo.json");
+  const cached = readJson(cacheFile);
+  if (
+    cached &&
+    cached.root === ctx.root &&
+    typeof cached.ts === "number" &&
+    Date.now() - cached.ts < 24 * 3600_000
+  ) {
+    return cached.top || undefined;
+  }
+  const res = git(ctx.root || ctx.cwd, ["rev-parse", "--show-toplevel"]);
+  const top = res.ok ? (res.text || "").trim() : "";
+  atomicWrite(
+    cacheFile,
+    JSON.stringify({ root: ctx.root, top, ts: Date.now() })
+  );
+  return top || undefined;
+}
+
+/**
+ * Translate a path under the git toplevel into one under the folder VS Code has
+ * open, or undefined when it is genuinely outside it.
+ *
+ * These are not always spelled the same. `git rev-parse --show-toplevel` returns
+ * a *resolved* path, while `--root` is whatever VS Code was given — and on macOS
+ * `/tmp` and `/var` are symlinks, so a repository under either produces
+ * `/private/var/...` from git and `/var/...` from the workspace. Comparing them
+ * directly puts every single file out of scope, silently. The same applies to any
+ * workspace opened through a symlink.
+ *
+ * The path handed onward is always the workspace spelling, because that is what
+ * `ChangeStore.isInScope` will compare against and what the user sees.
+ */
+function workspacePath(ctx, abs) {
+  if (!ctx.root) {
+    return abs;
+  }
+  if (isInside(ctx.root, abs)) {
+    return abs;
+  }
+  if (ctx.rootReal && isInside(ctx.rootReal, abs)) {
+    return path.join(ctx.root, path.relative(ctx.rootReal, abs));
+  }
+  return undefined;
+}
+
+/** Is this path one we are allowed to look at, let alone copy? */
+function allowed(ctx, abs) {
+  return !(
+    ctx.ignore.status === "ok" && ctx.ignore.rules.ignores(ctx.ignore.root, abs)
+  );
+}
+
+/**
+ * Record that a file changed but its previous content is not known exactly.
+ *
+ * The hook cannot call into the extension, so the note goes on disk and the
+ * extension drains it. This is what keeps the promise that a file Claude touched
+ * is never silently absent from the review queue — the alternative to an exact
+ * baseline is an explanation, never a guess.
+ */
+function writeNote(ctx, abs, reason, remedy) {
+  const key = pathKey(abs);
+  if (fs.existsSync(path.join(ctx.stateDir, "baselines", key))) {
+    return; // it was recovered exactly after all
+  }
+  atomicWrite(
+    path.join(ctx.stateDir, "unreviewable", `${key}.json`),
+    JSON.stringify({
+      path: abs,
+      reason,
+      ...(remedy ? { remedy } : {}),
+      ts: Date.now(),
+    })
+  );
+}
+
+const REMEDY_TURN_ON =
+  "Set claudeKeepUndo.detection.bashChanges to \"recover\" to capture these exactly.";
+
+/**
+ * Before the shell command runs: photograph the repository.
+ *
+ * One `git status` gives both halves of what Post needs — the commit the
+ * worktree is being compared against, and the exact set of paths that already
+ * differ from it. A path that is *clean* here needs nothing captured: git is
+ * holding its content already. Only the ones that already differ have to be
+ * copied aside, and in real repositories that set is tiny (1–3 files across the
+ * four checkouts measured).
+ */
+function bashPre(payload, input, ctx) {
+  if (ctx.bash === "off") {
+    return;
+  }
+  if (input.run_in_background === true) {
+    // Post fires when the shell is *launched*, not when it finishes, so the
+    // comparison would sample a tree the command has barely begun to touch and
+    // would keep touching afterwards. Detecting nothing is fine; detecting an
+    // arbitrary half is not, because the user would believe the review is
+    // complete.
+    ctx.note("", "bash: backgrounded command, the file system was not sampled");
+    return;
+  }
+  const snap = loadBashSnapshot();
+  if (!snap) {
+    ctx.note("", "bash: bashSnapshot unavailable");
+    return;
+  }
+  // A command that cannot write to a file needs no snapshot at all. Skipping it
+  // saves a `git status` and a process spawn on both phases, on roughly 43% of
+  // real calls. Pre and Post ask the same question of the same string, so a
+  // command skipped here is skipped there too.
+  if (snap.looksReadOnly(input.command)) {
+    return;
+  }
+  const top = gitToplevel(ctx);
+  if (!top) {
+    ctx.note("", "bash: not a git repository");
+    return;
+  }
+  const status = git(top, [
+    "status",
+    "--porcelain=v2",
+    "--branch",
+    "-z",
+    "-uall",
+  ]);
+  if (!status.ok) {
+    ctx.note("", "bash: git status failed");
+    return;
+  }
+  const parsed = snap.parseStatusV2(status.text);
+
+  const slot = {
+    v: 1,
+    ts: Date.now(),
+    ttlMs: snap.bashSlotTtl(input.timeout),
+    mode: ctx.bash,
+    top,
+    head: parsed.head ?? null,
+    notClean: [],
+    staged: {},
+    skipped: [],
+  };
+
+  let files = 0;
+  let bytes = 0;
+  for (const [rel, entry] of parsed.entries) {
+    if (!snap.isOrdinary(entry) || entry.xy === "!!") {
+      continue;
+    }
+    slot.notClean.push(rel);
+    if (ctx.bash !== "recover") {
+      continue; // the default tier reads no pre-existing file, ever
+    }
+    // Scope and the ignore rules are applied BEFORE the file is opened. This is
+    // the promise that makes a .keepundoignore worth having for a .env.
+    const abs = workspacePath(ctx, path.resolve(top, rel));
+    if (!abs || !allowed(ctx, abs)) {
+      continue;
+    }
+    const key = pathKey(abs);
+    if (fs.existsSync(path.join(ctx.stateDir, "baselines", key))) {
+      continue; // an older pre-Claude state is already recorded; keep it
+    }
+    if (snap.deletedInWorktree(entry)) {
+      continue; // already gone: nothing to read
+    }
+    if (files >= BASH_MAX_STAGED || bytes >= BASH_MAX_STAGED_BYTES) {
+      slot.skipped.push({ p: rel, why: "too many files had already been changed to capture them all" });
+      continue;
+    }
+    let buf;
+    try {
+      buf = fs.readFileSync(abs);
+    } catch {
+      slot.skipped.push({ p: rel, why: "it could not be read before the command ran" });
+      continue;
+    }
+    if (buf.length > BASH_MAX_FILE_BYTES) {
+      slot.skipped.push({ p: rel, why: "it is too large to capture" });
+      continue;
+    }
+    if (!isUtf8Text(buf)) {
+      slot.skipped.push({ p: rel, why: "it is not UTF-8 text, so it cannot be reviewed line by line" });
+      continue;
+    }
+    const pendingFile = path.join(ctx.stateDir, "pending", key);
+    const existing = readSidecar(pendingFile);
+    const fresh =
+      fs.existsSync(pendingFile) &&
+      existing &&
+      Date.now() - Number(existing.ts || 0) <
+        (typeof existing.ttlMs === "number" ? existing.ttlMs : PENDING_TTL_MS);
+    if (!fresh) {
+      if (!atomicWrite(pendingFile, buf.toString("utf8"))) {
+        slot.skipped.push({ p: rel, why: "it could not be copied aside" });
+        continue;
+      }
+      writeSidecar(pendingFile, abs, false, buf.length, slot.ttlMs);
+    }
+    slot.staged[rel] = { key, sha: sha256(buf), bytes: buf.length };
+    files++;
+    bytes += buf.length;
+  }
+
+  atomicWrite(
+    path.join(ctx.stateDir, "bash", `${snap.bashSlotId(payload, sha1Hex)}.json`),
+    JSON.stringify(slot)
+  );
+  ctx.note("", undefined, {
+    bash: "pre",
+    notClean: slot.notClean.length,
+    staged: files,
+  });
+}
+
+/**
+ * After the shell command ran: compare, and resolve each changed file to either
+ * a byte-exact baseline or a note saying why there is none.
+ */
+function bashPost(payload, input, ctx) {
+  if (ctx.bash === "off" || input.run_in_background === true) {
+    return;
+  }
+  const snap = loadBashSnapshot();
+  if (!snap || snap.looksReadOnly(input.command)) {
+    return;
+  }
+  const slotFile = path.join(
+    ctx.stateDir,
+    "bash",
+    `${snap.bashSlotId(payload, sha1Hex)}.json`
+  );
+  const slot = readJson(slotFile);
+  if (!slot || slot.v !== 1) {
+    ctx.note("", "bash: no snapshot was taken before the command");
+    return;
+  }
+  try {
+    if (Date.now() - slot.ts > slot.ttlMs) {
+      ctx.note("", "bash: the snapshot outlived the command");
+      return;
+    }
+    const status = git(slot.top, [
+      "status",
+      "--porcelain=v2",
+      "--branch",
+      "-z",
+      "-uall",
+    ]);
+    if (!status.ok) {
+      ctx.note("", "bash: git status failed");
+      return;
+    }
+    const post = snap.parseStatusV2(status.text);
+
+    // A `git commit`, `checkout` or `pull` inside the command leaves files clean
+    // at Post while they differ from the commit we photographed. One extra
+    // process, and only when HEAD actually moved.
+    let headMoved = [];
+    if (slot.head && post.head && slot.head !== post.head) {
+      const diff = git(slot.top, [
+        "diff",
+        "--name-only",
+        "-z",
+        slot.head,
+        post.head,
+      ]);
+      if (diff.ok) {
+        headMoved = diff.text.split("\0").filter(Boolean);
+      }
+    }
+
+    const buckets = snap.classify({
+      mode: slot.mode,
+      pre: {
+        head: slot.head ?? undefined,
+        notClean: new Set(slot.notClean),
+        staged: new Set(Object.keys(slot.staged)),
+        skipped: new Map((slot.skipped || []).map((x) => [x.p, x.why])),
+      },
+      post,
+      headMoved,
+    });
+    if (buckets.length > BASH_MAX_CANDIDATES) {
+      ctx.note("", `bash: too many changed files (${buckets.length})`);
+      return;
+    }
+    if (buckets.length === 0) {
+      return;
+    }
+
+    // One process for the whole candidate set. A path with a custom filter
+    // driver cannot have its old content reproduced from the object store.
+    const attrs = snap.parseCheckAttr(
+      git(
+        slot.top,
+        ["check-attr", "--stdin", "-z", "filter"],
+        buckets.map((b) => b.path).join("\0") + "\0"
+      ).text || ""
+    );
+
+    let recovered = 0;
+    for (const bucket of buckets) {
+      const abs = workspacePath(ctx, path.resolve(slot.top, bucket.path));
+      if (!abs || !allowed(ctx, abs)) {
+        continue;
+      }
+      const key = pathKey(abs);
+      const baselineFile = path.join(ctx.stateDir, "baselines", key);
+      const pendingFile = path.join(ctx.stateDir, "pending", key);
+      if (fs.existsSync(baselineFile)) {
+        continue; // the oldest pre-Claude state is already recorded
+      }
+
+      const promote = () => {
+        const staged = slot.staged[bucket.path];
+        if (!staged) {
+          writeNote(ctx, abs, snap.REASON_MODIFIED, REMEDY_TURN_ON);
+          return;
+        }
+        let buf;
+        try {
+          buf = fs.readFileSync(pendingFile);
+        } catch {
+          writeNote(ctx, abs, snap.REASON_MODIFIED, REMEDY_TURN_ON);
+          return;
+        }
+        // The copy must still be the bytes this call took. Another tool call
+        // replacing it in between would otherwise be promoted as this command's
+        // original.
+        if (sha256(buf) !== staged.sha) {
+          writeNote(ctx, abs, "another tool call replaced the copy taken before this command");
+          return;
+        }
+        let now;
+        try {
+          now = fs.readFileSync(abs);
+        } catch {
+          now = undefined;
+        }
+        if (now && sha256(now) === staged.sha) {
+          // Unchanged after all. Promoting here would register a baseline equal
+          // to the file, which resolves immediately — and worse, would show the
+          // user's own unsaved buffer as Claude's change.
+          remove(pendingFile);
+          remove(`${pendingFile}.json`);
+          return;
+        }
+        const sidecar = readSidecar(pendingFile);
+        let ok = false;
+        try {
+          fs.mkdirSync(path.dirname(baselineFile), { recursive: true });
+          fs.renameSync(pendingFile, baselineFile);
+          ok = true;
+        } catch {
+          try {
+            fs.copyFileSync(pendingFile, baselineFile);
+            remove(pendingFile);
+            ok = true;
+          } catch {
+            /* ignore */
+          }
+        }
+        if (ok) {
+          writeSidecar(baselineFile, abs, sidecar?.created === true, sidecar?.bytes);
+        }
+        remove(`${pendingFile}.json`);
+      };
+
+      if (bucket.kind === "staged") {
+        promote();
+        continue;
+      }
+
+      if (bucket.kind === "created") {
+        // A staging is proof the file existed for *some* Pre. Never delete on a
+        // contradiction: fall through to the copy instead.
+        if (fs.existsSync(pendingFile)) {
+          promote();
+          continue;
+        }
+        // Second, independent confirmation before an Undo is allowed to delete:
+        // git must agree the path is absent from the commit.
+        if (!slot.head) {
+          writeNote(ctx, abs, "its content before the command could not be established");
+          continue;
+        }
+        const probe = git(slot.top, [
+          "cat-file",
+          "--filters",
+          `--path=${bucket.path}`,
+          `${slot.head}:${bucket.path}`,
+        ]);
+        if (!probe.missingPath) {
+          writeNote(ctx, abs, "its content before the command could not be established");
+          continue;
+        }
+        if (atomicWrite(baselineFile, "")) {
+          writeSidecar(baselineFile, abs, true, 0);
+        }
+        continue;
+      }
+
+      if (bucket.kind === "recover") {
+        // `--filters`, never the raw blob: with `text=auto eol=crlf` the stored
+        // object has LF line endings while the worktree has CRLF, so the raw
+        // blob is not what the file held and an Undo would rewrite every line.
+        const attr = attrs.get(bucket.path);
+        if (attr !== "unspecified") {
+          writeNote(ctx, abs, attr === undefined
+            ? "git did not report whether a filter applies to it, so its previous content cannot be trusted"
+            : "a git filter is configured for it, so its previous content cannot be reproduced exactly");
+          continue;
+        }
+        if (recovered >= BASH_MAX_RECOVER) {
+          writeNote(ctx, abs, "too many files changed for all of them to be recovered");
+          continue;
+        }
+        recovered++;
+        const got = git(
+          slot.top,
+          ["cat-file", "--filters", `--path=${bucket.path}`, `${slot.head}:${bucket.path}`],
+          undefined,
+          true
+        );
+        if (got.missingPath || !got.ok || !got.buf) {
+          writeNote(ctx, abs, "its content before the command could not be recovered from git");
+          continue;
+        }
+        if (!isUtf8Text(got.buf)) {
+          writeNote(ctx, abs, "it is not UTF-8 text, so it cannot be reviewed line by line");
+          continue;
+        }
+        if (atomicWrite(baselineFile, got.buf.toString("utf8"))) {
+          writeSidecar(baselineFile, abs, false, got.buf.length);
+        }
+        continue;
+      }
+
+      writeNote(
+        ctx,
+        abs,
+        bucket.reason,
+        slot.mode === "recover" ? undefined : REMEDY_TURN_ON
+      );
+    }
+  } finally {
+    // Never leave a slot behind, whatever happened above.
+    remove(slotFile);
+  }
+}
+
 async function main() {
   const raw = await readStdin();
   let payload = {};
@@ -308,40 +861,21 @@ async function main() {
   }
 
   const input = payload.tool_input || {};
-  let filePath = input.file_path || input.filePath;
-  if (!filePath) {
-    return;
-  }
-  if (!path.isAbsolute(filePath)) {
-    filePath = path.resolve(cwd, filePath);
-  }
-
-  // Scope to the folder VS Code has open. The hook sees every file Claude
-  // touches — its own settings, a scratch file, a sibling repository — and
-  // staging those would copy their verbatim content into this workspace's
-  // storage before the extension ever gets a say. `--root` is absent from an
-  // install made before 1.1.0, in which case nothing is filtered here and the
-  // extension drops what it should not have.
   const root = flag("--root");
-  if (root && !isInside(root, filePath)) {
-    return;
-  }
-
-  const key = pathKey(filePath);
-  const baselineFile = path.join(stateDir, "baselines", key);
-  const pendingFile = path.join(stateDir, "pending", key);
+  const bashMode = flag("--bash") || "off";
   const eventsPath = path.join(stateDir, "events.ndjson");
 
-  /** One diagnostic line, with an optional reason for having done nothing. */
-  const record = (skipped) =>
+  /** One diagnostic line about some path, with an optional reason. */
+  const note = (forPath, skipped, extra) =>
     appendEvent(
       eventsPath,
       JSON.stringify({
         phase: mode,
-        path: filePath,
+        path: forPath,
         tool: payload.tool_name || "",
         ts: Date.now(),
         ...(skipped ? { skipped } : {}),
+        ...(extra || {}),
       }) + "\n"
     );
 
@@ -355,11 +889,55 @@ async function main() {
   // an excluded file is not something to discover by accident.
   const ignore = loadIgnoreRules(stateDir, root);
   if (ignore.status === "unavailable") {
-    record("ignore rules unavailable");
-  } else if (
-    ignore.status === "ok" &&
-    ignore.rules.ignores(ignore.root, filePath)
-  ) {
+    note("", "ignore rules unavailable");
+  }
+
+  // Fan out on the tool NAME, never on the shape of `tool_input`. The extension
+  // smoke-tests this script on every activation by piping a literal `{}` into
+  // it, relying on it returning before it writes anything; `{}` carries no
+  // `tool_name` and no `file_path`, so it falls through to the file-addressed
+  // branch and returns there. Branching on "there is no file_path" instead would
+  // turn that smoke test into a git probe on every window open.
+  if (payload.tool_name === "Bash") {
+    let rootReal;
+    try {
+      rootReal = root ? fs.realpathSync(root) : undefined;
+    } catch {
+      rootReal = undefined;
+    }
+    const ctx = { stateDir, root, rootReal, cwd, bash: bashMode, ignore, note };
+    if (mode === "pre") {
+      bashPre(payload, input, ctx);
+    } else {
+      bashPost(payload, input, ctx);
+    }
+    return;
+  }
+
+  let filePath = input.file_path || input.filePath || input.notebook_path;
+  if (!filePath) {
+    return;
+  }
+  if (!path.isAbsolute(filePath)) {
+    filePath = path.resolve(cwd, filePath);
+  }
+
+  // Scope to the folder VS Code has open. The hook sees every file Claude
+  // touches — its own settings, a scratch file, a sibling repository — and
+  // staging those would copy their verbatim content into this workspace's
+  // storage before the extension ever gets a say. `--root` is absent from an
+  // install made before 1.1.0, in which case nothing is filtered here and the
+  // extension drops what it should not have.
+  if (root && !isInside(root, filePath)) {
+    return;
+  }
+
+  const key = pathKey(filePath);
+  const baselineFile = path.join(stateDir, "baselines", key);
+  const pendingFile = path.join(stateDir, "pending", key);
+  const record = (skipped) => note(filePath, skipped);
+
+  if (ignore.status === "ok" && ignore.rules.ignores(ignore.root, filePath)) {
     record("ignored");
     return;
   }
@@ -375,7 +953,8 @@ async function main() {
       const fresh =
         fs.existsSync(pendingFile) &&
         staged &&
-        Date.now() - Number(staged.ts || 0) < PENDING_TTL_MS;
+        Date.now() - Number(staged.ts || 0) <
+          (typeof staged.ttlMs === "number" ? staged.ttlMs : PENDING_TTL_MS);
       if (!fresh) {
         let original = "";
         let created = false;

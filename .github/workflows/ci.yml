@@ -95,11 +95,18 @@ jobs:
           ! grep -qE '\.map$' packaged.txt || { echo "::error::source maps leaked into the package"; exit 1; }
           grep -q '^icon.png$' packaged.txt || { echo "::error::the Marketplace icon is missing"; exit 1; }
           grep -q '^hooks/keepundo-hook.mjs$' packaged.txt || { echo "::error::the hook script is missing"; exit 1; }
+          # The hook is a separate process that loads these two out of the package
+          # at runtime. Missing, the ignore rules stop being enforced inside the
+          # hook and shell-command detection silently does nothing — in the
+          # published build only, which is the worst place to find out.
+          for required in out/ignore.js out/detection/bashSnapshot.js; do
+            grep -q "^${required}$" packaged.txt || { echo "::error::${required} is missing from the package"; exit 1; }
+          done
           # The internal review documents quote the source verbatim and carry
           # absolute paths from the author's machine. .vscodeignore listed them by
           # name, so each new one shipped until somebody noticed; this is the check
           # that notices.
-          ! grep -qiE '^(REVIEW|PUBLISHING|CONTRIBUTING)' packaged.txt || { echo "::error::an internal document leaked into the package"; exit 1; }
+          ! grep -qiE '^(REVIEW|PUBLISHING|CONTRIBUTING|HANDOFF|research/)' packaged.txt || { echo "::error::an internal document leaked into the package"; exit 1; }
           ! grep -q '.DS_Store' packaged.txt || { echo "::error::a .DS_Store leaked into the package"; exit 1; }
           # Only README.md and CHANGELOG.md are meant to be published, plus the
           # walkthrough pages under media/, which the manifest points at. This was a

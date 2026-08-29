@@ -8,8 +8,32 @@ import * as path from "path";
  * merge and the "is what is installed still ours?" check need to be verifiable.
  */
 
+import { BashMode } from "./bashSnapshot";
+
 export const HOOK_MARKER = "keepundo-hook.mjs";
-export const MATCHER = "Edit|Write|MultiEdit";
+
+/**
+ * Which tool calls Claude Code runs our hook for.
+ *
+ * `Bash` is in the list only when the feature is switched on, and that is a
+ * deliberate cost decision rather than caution: Claude Code issues roughly twelve
+ * Bash calls for every Edit — 26,249 against 2,210 across this developer's whole
+ * transcript history — and each one would spawn `node` twice just to decide it
+ * has nothing to do.
+ *
+ * `NotebookEdit` is unconditional. It carries its target as `notebook_path`,
+ * which the hook now reads, and an `.ipynb` is JSON that round-trips as UTF-8.
+ *
+ * Every alternative is spelled out and the order is alphabetical, so the string
+ * is stable and diffable. Do not lean on `Edit` matching `NotebookEdit` as an
+ * unanchored substring: whether Claude Code anchors the regex is not something
+ * this codebase can observe, and a wrong guess would silently register nothing.
+ */
+export function matcherFor(bash: BashMode): string {
+  return bash === "off"
+    ? "Edit|MultiEdit|NotebookEdit|Write"
+    : "Bash|Edit|MultiEdit|NotebookEdit|Write";
+}
 
 export interface HookCommand {
   type: "command";
@@ -39,10 +63,16 @@ export function hookCommand(
   extensionPath: string,
   stateDir: string,
   mode: HookMode,
-  workspaceRoot?: string
+  workspaceRoot: string | undefined,
+  bash: BashMode
 ): string {
   const root = workspaceRoot ? ` --root "${workspaceRoot}"` : "";
-  return `node "${hookScriptPath(extensionPath)}" ${mode} --state "${stateDir}"${root}`;
+  // The mode travels in the command string rather than in a published
+  // descriptor, and that is what makes changing the setting self-healing:
+  // `inspectHooks` compares the exact string, so a different mode is classified
+  // `stale` and `repairHooksIfStale` rewrites the registration. No new
+  // mechanism, and no way for the setting and what is installed to drift apart.
+  return `node "${hookScriptPath(extensionPath)}" ${mode} --state "${stateDir}"${root} --bash ${bash}`;
 }
 
 /** The `…/hooks/keepundo-hook.mjs` path referenced by a hook command, if any. */
@@ -125,6 +155,34 @@ function ourEntriesFor(settings: unknown, event: string): HookMatcher[] {
   return out;
 }
 
+/**
+ * The matcher strings on our own entries.
+ *
+ * Used to tell a path repair from a widening of *which tool calls* Claude Code
+ * runs our script for. The first is housekeeping; the second is a broader
+ * consent than the user originally gave, and is worth saying out loud once.
+ */
+export function ourMatchers(settings: unknown): string[] {
+  const hooks = (settings as { hooks?: Record<string, unknown> })?.hooks;
+  if (!hooks || typeof hooks !== "object") {
+    return [];
+  }
+  const out: string[] = [];
+  for (const group of Object.values(hooks)) {
+    for (const matcher of asMatchers(group)) {
+      if (
+        matcher.hooks.some(
+          (h) =>
+            typeof h?.command === "string" && h.command.includes(HOOK_MARKER)
+        )
+      ) {
+        out.push(matcher.matcher ?? "");
+      }
+    }
+  }
+  return out;
+}
+
 /** Whether these settings mention our hook script at all. */
 export function hasOurHooks(settings: unknown): boolean {
   return allHookCommands(settings).some((c) => c.includes(HOOK_MARKER));
@@ -164,7 +222,8 @@ export function inspectHooks(
   settings: unknown,
   extensionPath: string,
   stateDir: string,
-  workspaceRoot?: string
+  workspaceRoot: string | undefined,
+  bash: BashMode
 ): HookState {
   const ours = allHookCommands(settings).filter((c) => c.includes(HOOK_MARKER));
   if (ours.length === 0) {
@@ -189,12 +248,12 @@ export function inspectHooks(
       return "stale";
     }
     const [entry] = entries;
-    if (entry.matcher !== MATCHER || entry.hooks.length !== 1) {
+    if (entry.matcher !== matcherFor(bash) || entry.hooks.length !== 1) {
       return "stale";
     }
     if (
       entry.hooks[0].command !==
-      hookCommand(extensionPath, stateDir, mode, workspaceRoot)
+      hookCommand(extensionPath, stateDir, mode, workspaceRoot, bash)
     ) {
       return "stale";
     }
@@ -333,16 +392,20 @@ function stripOurEntries(
  * Add our hook to a matcher group, reusing an existing entry with the same
  * matcher instead of appending a duplicate block next to it.
  */
-function withOurHook(matchers: unknown, command: string): HookMatcher[] {
+function withOurHook(
+  matchers: unknown,
+  command: string,
+  matcher: string
+): HookMatcher[] {
   const next = stripOurEntries(matchers);
   const entry: HookCommand = { type: "command", command };
-  const existing = next.find((m) => m.matcher === MATCHER);
+  const existing = next.find((m) => m.matcher === matcher);
   if (existing) {
     return next.map((m) =>
       m === existing ? { ...m, hooks: [...m.hooks, entry] } : m
     );
   }
-  return [...next, { matcher: MATCHER, hooks: [entry] }];
+  return [...next, { matcher, hooks: [entry] }];
 }
 
 /**
@@ -353,7 +416,8 @@ export function mergeHooks(
   settings: Record<string, unknown>,
   extensionPath: string,
   stateDir: string,
-  workspaceRoot?: string
+  workspaceRoot: string | undefined,
+  bash: BashMode
 ): Record<string, unknown> {
   const raw = settings.hooks;
   const hooks: Record<string, unknown> =
@@ -366,11 +430,13 @@ export function mergeHooks(
       ...hooks,
       PreToolUse: withOurHook(
         hooks.PreToolUse ?? [],
-        hookCommand(extensionPath, stateDir, "pre", workspaceRoot)
+        hookCommand(extensionPath, stateDir, "pre", workspaceRoot, bash),
+        matcherFor(bash)
       ),
       PostToolUse: withOurHook(
         hooks.PostToolUse ?? [],
-        hookCommand(extensionPath, stateDir, "post", workspaceRoot)
+        hookCommand(extensionPath, stateDir, "post", workspaceRoot, bash),
+        matcherFor(bash)
       ),
     },
   };

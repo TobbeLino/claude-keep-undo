@@ -45,6 +45,9 @@ CONTRIBUTING.md
 # the repository URL, so the "Full reference" link resolves against GitHub whether
 # or not the file is in the .vsix.
 REFERENCE.md
+# The README's demo GIF does not need to be in the package: vsce rewrites
+# the relative `src` to the repository URL, so the Marketplace loads it from GitHub.
+showcase.gif
 
 # Local dev/runtime state — must never ship in the package
 .claude/**

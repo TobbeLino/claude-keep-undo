@@ -6,6 +6,7 @@ import { LineChange } from "./diff";
 import {
   hooksState,
   installHooksInteractive,
+  warnIfBashDetectionUnavailable,
   maybePromptInstall,
   repairHooksIfStale,
 } from "./detection/hookInstaller";
@@ -557,7 +558,12 @@ export function activate(
   // the menus or the settings panel.
   const currentHookState = (): HookState => {
     try {
-      return hooksState(workspaceRoot, context.extensionPath, stateDir);
+      return hooksState(
+        workspaceRoot,
+        context.extensionPath,
+        stateDir,
+        settings.bashChanges()
+      );
     } catch (err) {
       log(`could not read the hook registration: ${String(err)}`);
       return "missing";
@@ -709,6 +715,25 @@ export function activate(
   let transcript: TranscriptWatcher | undefined;
 
   const syncDetectors = (): void => {
+    if (settings.useHooks() && hookWatcher) {
+      // Already running, but the registration may no longer match what the
+      // settings ask for: the Bash tier travels inside the recorded command, so
+      // changing it makes the installed hook stale. Without this the setting
+      // appears to do nothing until the window is reloaded — the same trap
+      // documented for trackOutsideWorkspace.
+      try {
+        repairHooksIfStale(
+          workspaceRoot,
+          context.extensionPath,
+          stateDir,
+          settings.bashChanges(),
+          log,
+          context.workspaceState
+        );
+      } catch (err) {
+        log(`could not inspect the hook registration: ${String(err)}`);
+      }
+    }
     if (settings.useHooks() && !hookWatcher) {
       hookWatcher = new KeepUndoWatcher(stateDir, store);
       // An extension update moves the install directory, which silently breaks
@@ -725,6 +750,7 @@ export function activate(
           workspaceRoot,
           context.extensionPath,
           stateDir,
+          settings.bashChanges(),
           log,
           context.workspaceState
         );
@@ -736,6 +762,18 @@ export function activate(
           ? "Hooks detected: real-time detection active."
           : `Hooks not active (${state}).`
       );
+      // Separate question from whether the hooks are registered: they can be
+      // installed and working while shell-command detection still captures
+      // nothing, because that half is worked out from Git. Asked once, and off
+      // the activation path — it spawns a process.
+      if (state === "ok") {
+        void warnIfBashDetectionUnavailable(
+          workspaceRoot,
+          settings.bashChanges(),
+          log,
+          context.workspaceState
+        );
+      }
     } else if (!settings.useHooks() && hookWatcher) {
       hookWatcher.dispose();
       hookWatcher = undefined;
@@ -762,6 +800,7 @@ export function activate(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (
         e.affectsConfiguration("claudeKeepUndo.detection.useHooks") ||
+        e.affectsConfiguration("claudeKeepUndo.detection.bashChanges") ||
         e.affectsConfiguration("claudeKeepUndo.detection.useTranscript")
       ) {
         syncDetectors();

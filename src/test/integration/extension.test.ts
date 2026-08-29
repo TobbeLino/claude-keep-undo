@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { probeBashDetection } from "../../detection/hookInstaller";
 import type { KeepUndoApi } from "../../extension";
 import {
   atomicWrite,
@@ -12,6 +13,7 @@ import {
   pendingDir,
   sidecarPath,
   snapshotsDir,
+  unreviewableDir,
 } from "../../util";
 
 const EXT_ID = "FedeFluork.claude-keep-undo";
@@ -967,6 +969,90 @@ describe("Keep / Undo for Claude Code", () => {
       assert.equal(
         api.store.isIgnored(path.join(root, "src", "app.ts")),
         false
+      );
+    });
+  });
+
+  describe("files changed by a shell command", () => {
+    /**
+     * The hook runs in its own process and cannot call into the extension, so a
+     * file whose previous content it could not establish is described in a note
+     * on disk. If nothing drained those, such a file would simply be absent from
+     * the review queue — which, to the user, is indistinguishable from Claude not
+     * having touched it.
+     */
+    it("lists a file the hook could not recover, with the reason", async () => {
+      const file = path.join(root, "by-shell.ts");
+      fs.writeFileSync(file, "after the command\n");
+      created.push(file);
+      atomicWrite(
+        path.join(unreviewableDir(stateDir), `${pathKey(file)}.json`),
+        JSON.stringify({
+          path: file,
+          reason: "it was changed by a shell command",
+          remedy: "Turn on exact recovery.",
+          ts: Date.now(),
+        })
+      );
+      await wait(600);
+
+      const listed = api.store.getUnreviewable().find((u) => u.path === file);
+      assert.ok(listed, "the file must appear in the review queue");
+      assert.match(listed.reason, /shell command/);
+      assert.match(listed.reason, /Turn on exact recovery/, "remedy included");
+      assert.equal(
+        fs.existsSync(
+          path.join(unreviewableDir(stateDir), `${pathKey(file)}.json`)
+        ),
+        false,
+        "and the note is consumed, not left to be read again"
+      );
+    });
+
+    it("reports whether shell-command detection can run here at all", async () => {
+      // The hooks can be installed and working while this half captures nothing,
+      // because what a command changed is worked out from Git. An empty review
+      // queue must never be the only clue, so the state is asked explicitly.
+      //
+      // Asked by running `git rev-parse` rather than by looking for a `.git`
+      // directory, which is what makes a worktree, a submodule and a `.git` file
+      // all answer correctly — and it settles the other half of the question,
+      // whether git can be run at all, in the same call.
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "keepundo-nogit-"));
+      try {
+        assert.equal(
+          await probeBashDetection(outside),
+          "not-a-repository",
+          "a plain directory cannot support it"
+        );
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+      // The test workspace lives inside this repository, so git finds a toplevel
+      // by walking up — which is the answer that matters, not the folder name.
+      assert.equal(
+        await probeBashDetection(root),
+        undefined,
+        "inside a repository it is available"
+      );
+    });
+
+    it("drops a note for a file that was recovered exactly after all", async () => {
+      // The changes view lists tracked files and unreviewable ones separately,
+      // so a file with both would appear twice.
+      const file = path.join(root, "recovered.ts");
+      fs.writeFileSync(file, "new\n");
+      created.push(file);
+      seedBaseline(file, "old\n");
+      atomicWrite(
+        path.join(unreviewableDir(stateDir), `${pathKey(file)}.json`),
+        JSON.stringify({ path: file, reason: "stale note", ts: Date.now() })
+      );
+      await wait(600);
+
+      assert.ok(
+        !api.store.getUnreviewable().some((u) => u.path === file),
+        "not listed as unreviewable when it has a baseline"
       );
     });
   });

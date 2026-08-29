@@ -8,6 +8,7 @@
  * a plain unit test.
  */
 
+import { FileBackup, fileBackupFrom } from "./fileHistory";
 import { EditEvent } from "./reconstruct";
 
 export interface ToolUseBlock {
@@ -28,6 +29,23 @@ export interface TranscriptLine {
   timestamp: number | undefined;
   uses: ToolUseBlock[];
   results: ToolResultBlock[];
+  /**
+   * The working directory this line was recorded in.
+   *
+   * Not the same as the workspace root, and not constant within a session: a
+   * `cd` in a Bash call persists, and one real session here records 13 distinct
+   * values. It is what a relative `file_path` has to be resolved against.
+   */
+  cwd: string | undefined;
+  /**
+   * Pointers to Claude Code's own pre-edit copies of a file.
+   *
+   * These arrive on their own records, not inside a message, which is why they
+   * used to be dropped on the floor: the parser returned as soon as
+   * `message.content` was not an array. They are the most faithful baseline
+   * available anywhere — see fileHistory.ts.
+   */
+  backups: FileBackup[];
 }
 
 /**
@@ -49,7 +67,21 @@ export function parseTranscriptLine(line: string): TranscriptLine | undefined {
   const record = obj as {
     message?: { content?: unknown };
     timestamp?: unknown;
+    cwd?: unknown;
   };
+  const cwd =
+    typeof record.cwd === "string" && record.cwd ? record.cwd : undefined;
+  const timestamp = parseTimestamp(record.timestamp);
+
+  // Checked before `message.content`, because a file-history record has no
+  // message at all and would otherwise be discarded by the guard below — which
+  // is exactly what kept the extension reconstructing baselines it could simply
+  // have read.
+  const backup = fileBackupFrom(obj, timestamp);
+  if (backup) {
+    return { timestamp, cwd, uses: [], results: [], backups: [backup] };
+  }
+
   const content = record?.message?.content;
   if (!Array.isArray(content)) {
     return undefined;
@@ -78,7 +110,7 @@ export function parseTranscriptLine(line: string): TranscriptLine | undefined {
       }
     }
   }
-  return { timestamp: parseTimestamp(record.timestamp), uses, results };
+  return { timestamp, cwd, uses, results, backups: [] };
 }
 
 /**
@@ -119,17 +151,115 @@ export function editEventFor(
       })),
     };
   }
-  return name === "Write" ? { kind: "write" } : undefined;
+  if (name === "Write") {
+    return { kind: "write" };
+  }
+  // A NotebookEdit replaces one cell's source, but the file on disk wraps that
+  // source in JSON with its own escaping, `outputs` and `execution_count`.
+  // Modelling it as a string edit would hand `reverseApply` an `old_string` that
+  // does not occur in the file — or, far worse, one that occurs by coincidence.
+  // Treated as a whole-file write instead, so it takes the backup/snapshot path
+  // where the content is retrieved rather than replayed.
+  return name === "NotebookEdit" ? { kind: "write" } : undefined;
 }
 
-/** The file path a tool call names, verbatim (still possibly relative). */
+/**
+ * The file path a tool call names, verbatim (still possibly relative).
+ *
+ * `notebook_path` is the third key rather than an afterthought: `NotebookEdit`
+ * carries its target under that name alone, so without it every notebook edit
+ * was dropped before any other decision was reached.
+ */
 export function filePathOf(input: Record<string, unknown>): string | undefined {
-  if (typeof input.file_path === "string" && input.file_path) {
-    return input.file_path;
+  for (const key of ["file_path", "filePath", "notebook_path"]) {
+    const value = input[key];
+    if (typeof value === "string" && value) {
+      return value;
+    }
   }
-  return typeof input.filePath === "string" && input.filePath
-    ? input.filePath
-    : undefined;
+  return undefined;
+}
+
+/**
+ * Key names an MCP server might put a file path under. There is no convention,
+ * so this is the observed union rather than a specification.
+ */
+const MCP_PATH_KEYS = [
+  "path",
+  "file",
+  "file_path",
+  "filePath",
+  "filename",
+  "fileName",
+  "uri",
+  "target",
+  "destination",
+];
+
+/**
+ * Verbs that mean an MCP tool changes a file rather than reading one.
+ *
+ * Matched against the tool name, never the arguments. The asymmetry is
+ * deliberate: a false negative leaves the tool undetected, which is exactly
+ * where things stand today, while a false positive puts a file the server only
+ * *read* into the review queue with a note saying its content is unknown. The
+ * first is a gap, the second is noise in the one surface that must stay
+ * trustworthy.
+ */
+const MCP_WRITE_VERBS =
+  /(write|edit|create|save|update|patch|append|move|rename|delete|remove|mkdir|put)/i;
+
+/**
+ * The files an MCP tool call appears to have changed.
+ *
+ * Nothing here tries to reconstruct what it did — the semantics are per-server
+ * and unknowable — so the caller's only honest move is `noteUnreviewable`:
+ * the file is listed with an explanation instead of silently missing. Only
+ * absolute paths are returned, because a relative one would have to be resolved
+ * against a working directory this call does not record.
+ */
+export function mcpWritePathsFrom(
+  name: string,
+  input: Record<string, unknown>
+): string[] {
+  if (!name.startsWith("mcp__") || !MCP_WRITE_VERBS.test(name)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const key of MCP_PATH_KEYS) {
+    const value = input[key];
+    if (typeof value !== "string" || !value) {
+      continue;
+    }
+    const candidate = value.startsWith("file://")
+      ? decodeFileUri(value)
+      : value;
+    if (candidate && isAbsolutePath(candidate) && !out.includes(candidate)) {
+      out.push(candidate);
+    }
+  }
+  return out;
+}
+
+function decodeFileUri(uri: string): string | undefined {
+  try {
+    const withoutScheme = uri.slice("file://".length);
+    // `file:///abs` keeps its leading slash; a host form is not a local path.
+    return withoutScheme.startsWith("/")
+      ? decodeURIComponent(withoutScheme)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** POSIX absolute, or a Windows drive/UNC path — this runs on both. */
+function isAbsolutePath(value: string): boolean {
+  return (
+    value.startsWith("/") ||
+    /^[A-Za-z]:[\\/]/.test(value) ||
+    value.startsWith("\\\\")
+  );
 }
 
 /**
@@ -207,6 +337,42 @@ export function trustWriteSnapshot(
     };
   }
   return { kind: "baseline", baseline: snapshot.content, created: false };
+}
+
+/**
+ * The working directory a transcript belongs to, read from its opening lines.
+ *
+ * Claude Code names its project folder by replacing every non-alphanumeric
+ * character in the cwd with a dash, which is lossy and not invertible:
+ * `/x/proj/sub`, `/x/proj-sub`, `/x/proj_sub` and `/x/proj.sub` all produce the
+ * same folder. Deriving the folder from the workspace root therefore both misses
+ * sessions (one launched from a subdirectory writes somewhere else entirely) and
+ * finds foreign ones. The transcript states its own `cwd`, so it is read instead
+ * of guessed.
+ *
+ * `head` is the first few KB of the file, not the whole of it: the field appears
+ * within the opening records — the third line in every transcript on this
+ * developer's machine — and a transcript can be hundreds of megabytes.
+ */
+export function transcriptCwdFrom(head: string): string | undefined {
+  for (const line of head.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      // A truncated final line is expected — `head` cuts at a byte count — and
+      // is simply not the line we are looking for.
+      continue;
+    }
+    const cwd = (parsed as { cwd?: unknown })?.cwd;
+    if (typeof cwd === "string" && cwd) {
+      return cwd;
+    }
+  }
+  return undefined;
 }
 
 /** A tool_result's content is either a string or an array of content blocks. */

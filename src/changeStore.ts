@@ -27,6 +27,7 @@ import {
   moveDir,
   normalizePath,
   pathKey,
+  bashDir,
   pendingDir,
   readFileBytesResult,
   readFileSafe,
@@ -147,6 +148,21 @@ export interface UndoBatchResult {
 }
 
 /** How long a snapshot taken before a destructive action is kept around. */
+/**
+ * How long a staged copy stays valid when the record does not say otherwise.
+ *
+ * Must match PENDING_TTL_MS in the hook: the two sides both decide whether a
+ * staging is fresh, and a disagreement either promotes a stale copy as the
+ * original or discards a good one.
+ */
+const PENDING_TTL_MS = 60_000;
+
+/** A backstop on the per-command snapshot directory; the Post cleans up its own. */
+const BASH_SLOT_MAX = 200;
+
+/** How often expired stagings, snapshots and command slots are swept. */
+const HOUSEKEEPING_MS = 5 * 60_000;
+
 const SNAPSHOT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const SNAPSHOT_MAX = 200;
 
@@ -204,6 +220,7 @@ export class ChangeStore implements vscode.Disposable {
   private disposed = false;
   private trackOutsideWorkspace = false;
   private readonly normalizedRoot: string;
+  private housekeeping: NodeJS.Timeout | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly _onDidChange = new vscode.EventEmitter<
     vscode.Uri | undefined
@@ -242,10 +259,29 @@ export class ChangeStore implements vscode.Disposable {
     );
     this.migrateLegacyState();
     this.pruneSnapshots();
+    // On a timer as well as at startup. A window left open for a week used to
+    // prune nothing at all — `pruneSnapshots` ran only here — and an expired
+    // staging is not merely clutter: it is a verbatim copy of the user's source,
+    // and one that a later capture could promote as an original it never was.
+    this.housekeeping = setInterval(() => {
+      if (this.disposed) {
+        return;
+      }
+      this.sweepPendingState();
+      this.sweepBashState();
+      this.pruneSnapshots();
+    }, HOUSEKEEPING_MS);
+    // Node keeps the process alive for a pending interval; ours must not hold
+    // the extension host open.
+    this.housekeeping.unref?.();
   }
 
   dispose(): void {
     this.disposed = true;
+    if (this.housekeeping) {
+      clearInterval(this.housekeeping);
+      this.housekeeping = undefined;
+    }
     for (const d of this.disposables) {
       d.dispose();
     }
@@ -1345,13 +1381,83 @@ export class ChangeStore implements vscode.Disposable {
       }
       const contentPath = path.join(dir, name);
       const sidecar = readSidecar(contentPath);
-      if (!sidecar || this.shouldTrack(sidecar.path)) {
+      if (!sidecar) {
+        continue;
+      }
+      if (!this.shouldTrack(sidecar.path)) {
+        this.markStateWrite();
+        this.log(
+          `dropping the staged copy of ${sidecar.path}: not under review`
+        );
+        removeFile(contentPath);
+        removeFile(sidecarPath(contentPath));
+        continue;
+      }
+      // A staging whose Post phase never ran. Nothing else revisits these, so
+      // one left behind is a verbatim copy of the user's source sitting on disk
+      // indefinitely — and, worse, one a later Pre for the same path would find
+      // and promote as an "original" captured minutes or days earlier.
+      const ttl = sidecar.ttlMs ?? PENDING_TTL_MS;
+      if (Date.now() - sidecar.ts <= ttl) {
         continue;
       }
       this.markStateWrite();
-      this.log(`dropping the staged copy of ${sidecar.path}: not under review`);
       removeFile(contentPath);
       removeFile(sidecarPath(contentPath));
+      // Only a Bash staging carries a ttlMs, and only for those is expiry worth
+      // reporting: it means a shell command was interrupted before its changes
+      // could be recorded, and the file really did change. An Edit staging
+      // expiring is the old, benign case — a denied tool call — and stays quiet.
+      if (sidecar.ttlMs !== undefined && !this.hasBaseline(sidecar.path)) {
+        this.log(
+          `the copy staged for ${sidecar.path} expired before it was used`
+        );
+        this.noteUnreviewable(
+          sidecar.path,
+          "a shell command was interrupted before what it changed could be recorded"
+        );
+      }
+    }
+  }
+
+  /**
+   * Drop per-command snapshots whose Post phase never ran.
+   *
+   * The Post deletes its own slot in a `finally`, so anything left here belongs
+   * to a command that was denied, interrupted, or outlived its window. They are
+   * small, but nothing else would ever remove them.
+   */
+  private sweepBashState(): void {
+    const dir = bashDir(this.stateDir);
+    const entries: { file: string; ts: number }[] = [];
+    for (const name of listDir(dir)) {
+      if (!name.endsWith(".json") || name === "repo.json") {
+        continue;
+      }
+      const file = path.join(dir, name);
+      const raw = readFileSafe(file);
+      let slot: { ts?: number; ttlMs?: number } | undefined;
+      try {
+        slot = raw
+          ? (JSON.parse(raw) as { ts?: number; ttlMs?: number })
+          : undefined;
+      } catch {
+        slot = undefined;
+      }
+      const ts = Number(slot?.ts) || 0;
+      const ttl = Number(slot?.ttlMs) || PENDING_TTL_MS;
+      if (!slot || Date.now() - ts > ttl) {
+        removeFile(file);
+        continue;
+      }
+      entries.push({ file, ts });
+    }
+    // A backstop against a directory that somehow keeps growing: oldest first.
+    if (entries.length > BASH_SLOT_MAX) {
+      entries.sort((a, b) => a.ts - b.ts);
+      for (const entry of entries.slice(0, entries.length - BASH_SLOT_MAX)) {
+        removeFile(entry.file);
+      }
     }
   }
 

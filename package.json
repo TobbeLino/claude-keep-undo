@@ -2,7 +2,7 @@
   "name": "claude-keep-undo",
   "displayName": "Keep / Undo for Claude Code",
   "description": "Review every change Claude Code makes to your files and Keep or Undo them hunk by hunk, Copilot-style.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "FedeFluork",
   "author": {
     "name": "FedeFluork"
@@ -273,21 +273,42 @@
             "default": true,
             "description": "Detect Claude's edits through Claude Code's PreToolUse/PostToolUse hooks (requires installing the hooks in the project)."
           },
+          "claudeKeepUndo.detection.bashChanges": {
+            "type": "string",
+            "order": 2,
+            "default": "created",
+            "enum": [
+              "created",
+              "recover",
+              "off"
+            ],
+            "enumItemLabels": [
+              "Files it creates",
+              "Files it creates and modifies",
+              "Nothing"
+            ],
+            "enumDescriptions": [
+              "Files a shell command creates are reviewable, and Undo deletes them. Exact by construction: no pre-existing file is read. A modified file is listed as not reviewable.",
+              "Also recovers what a modified file held before the command, from Git or from a copy taken beforehand. Reads changed files before each command runs.",
+              "Shell commands are ignored entirely and the hook does not run on them."
+            ],
+            "description": "How much of what Claude changes by running a shell command (sed, a redirect, mv, a formatter) is captured. Requires the Claude Code hooks and a Git repository."
+          },
           "claudeKeepUndo.detection.useTranscript": {
             "type": "boolean",
-            "order": 2,
+            "order": 3,
             "default": true,
             "description": "Detect Claude's edits by reading the session transcript in ~/.claude/projects (automatic zero-config fallback)."
           },
           "claudeKeepUndo.promptToInstallHooks": {
             "type": "boolean",
-            "order": 3,
+            "order": 4,
             "default": true,
             "description": "Offer to install the Claude Code hooks on startup when they are missing."
           },
           "claudeKeepUndo.trackOutsideWorkspace": {
             "type": "boolean",
-            "order": 4,
+            "order": 5,
             "default": false,
             "description": "Also review Claude's edits to files outside the open folder (its own settings, scratch files, sibling repositories). Off by default: those files cannot be shown in the Explorer, and their baselines would be copied into this workspace's storage."
           }

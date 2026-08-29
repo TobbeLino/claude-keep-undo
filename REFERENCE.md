@@ -169,8 +169,10 @@ switchable.
 
 ### 1. Claude Code hooks — precise, real-time
 
-The extension registers `PreToolUse` and `PostToolUse` hooks matching
-`Edit|Write|MultiEdit` in `<workspace>/.claude/settings.local.json`.
+The extension registers `PreToolUse` and `PostToolUse` hooks in
+`<workspace>/.claude/settings.local.json`, matching
+`Edit|MultiEdit|NotebookEdit|Write` — and `Bash` as well, unless shell-command
+detection is switched off.
 
 - **`PreToolUse`** runs *before* Claude writes. It captures the file's original
   content and stages it under `pending/`. It deliberately does **not** publish
@@ -182,6 +184,62 @@ The extension registers `PreToolUse` and `PostToolUse` hooks matching
 The hook script never blocks a tool call: it swallows every error and always
 exits `0`.
 
+#### Changes made by running a shell command
+
+Claude does not only use its edit tools. It runs `sed -i`, redirects into a file,
+moves and deletes things, runs a formatter or a code generator — and a `Bash`
+tool call records only the command, never what it touched. Measured across this
+developer's whole history, Claude Code issues about **twelve Bash calls for every
+edit-tool call**, so this is not an edge case.
+
+Git is what makes it answerable, for one reason: `git status` costs
+*O(tracked files)* while walking the tree costs *O(tree)*. On a real 69,000-file
+checkout with 780 tracked files, status answers in 23 ms where the walk needs
+708 — and the walk still would not say what those files used to hold. Git knows
+both.
+
+- **Before the command**, one `git status` records the commit the worktree is
+  being compared against and the exact set of paths that already differ from it.
+  Only those already-differing files are copied aside; in real repositories that
+  is one to three files. A file that matches the last commit needs nothing
+  copied, because Git is already holding its content.
+- **After the command**, a second `git status` says what changed, and every
+  changed file resolves to exactly one outcome: it did not exist before (the
+  baseline is empty and Undo deletes it), we hold a copy taken beforehand, or Git
+  holds its previous content. Anything else is listed as *not reviewable* with
+  the reason — never shown against a guess.
+
+Content recovered from Git comes through `git cat-file --filters`, not the raw
+object. In a repository with `text=auto eol=crlf` the stored object has LF line
+endings while the working file has CRLF, so the raw blob is *not* what the file
+held, and an Undo built from it would rewrite every line in the file.
+
+A command that cannot write to a file — `ls`, `cat`, `grep`, `git status` and a
+short list of others, with no redirect, pipe, substitution or heredoc anywhere in
+it — is skipped without a snapshot. The list is deliberately tiny: a name missing
+from it costs a few milliseconds, while a name wrongly on it costs an undetected
+change.
+
+**This half needs a Git repository.** Outside one — or with Git not on the
+`PATH` — files changed by a shell command are not detected at all. Everything
+Claude changes with its ordinary edit tools is unaffected, hooks and transcript
+alike. The extension checks once per workspace and says so, with the option to
+switch the feature off, rather than leaving you to infer it from an empty review
+queue.
+
+Two further cases are deliberately not covered. A command run with
+`run_in_background` finishes after the hook has already sampled the filesystem,
+so nothing is recorded rather than an arbitrary half. And a file written and put
+back within one command is invisible to Git — correctly, since there is nothing
+to review.
+
+How much is captured is set by
+[`claudeKeepUndo.detection.bashChanges`](#detection). The default,
+**Files it creates**, reads no pre-existing file at all: the baseline of a file
+that did not exist is not a guess, so that tier is structurally incapable of
+recording a wrong one. **Files it creates and modifies** additionally copies
+already-modified files aside before each command.
+
 The hooks are registered in **`.claude/settings.local.json`**, which Claude Code
 treats as personal and machine-local — the command contains absolute paths that
 have no business in a committed file. If the extension updates, or the workspace
@@ -192,10 +250,30 @@ Install or re-install them any time via the command palette:
 
 ### 2. Session transcript — zero-config fallback
 
-The extension tails the active session transcript at
-`~/.claude/projects/<encoded-cwd>/<session>.jsonl`, extracts `Edit`, `Write` and
-`MultiEdit` tool calls, and **reconstructs** the pre-Claude content by
-reverse-applying those edits to the file currently on disk.
+The extension tails the session transcripts under
+`~/.claude/projects/<encoded-cwd>/`, extracts `Edit`, `Write`, `MultiEdit` and
+`NotebookEdit` tool calls, and establishes the pre-Claude content of each file
+they touch.
+
+**Every transcript under that directory is read, not only the session's own.** A
+subagent — anything launched as a Task, and every agent in a workflow — writes to
+its own file one to three levels down, and its tool calls are *not* mirrored into
+the parent transcript. On this developer's machine the nested files outnumbered
+the top-level ones thirty to one, and everything they changed used to be
+invisible.
+
+Where possible the content is **retrieved rather than reconstructed.** Before it
+edits a file, Claude Code copies the original aside under
+`~/.claude/file-history/<session>/` and names that copy in the transcript. The
+copy is a byte-exact image of the file as it was, so the extension reads it
+directly. Retrieval has none of the failure modes of replaying an edit list, and
+it settles a question a replay cannot: when Claude Code records *no* copy, it is
+because the file did not exist — which is how a created file is recognised
+without inferring it from timing.
+
+When no copy is available — Claude Code prunes them — the extension falls back to
+**reconstructing** the pre-Claude content by reverse-applying the recorded edits
+to the file currently on disk.
 
 It only reacts to edits made **from the moment the extension attaches** — it does
 not replay a session's earlier history, so the review queue does not flood on
@@ -227,8 +305,18 @@ extension refuses instead:
   older than the tool call, or the content read may be Claude's own output).
 
 Files in any of those categories are listed with an explanation rather than shown
-against a guessed baseline. **Install the hooks for exact baselines and full
-coverage.**
+against a guessed baseline — but only when no copy was available, since a
+retrieved baseline is subject to none of these refusals. **Install the hooks for
+exact baselines and full coverage.**
+
+Changes made by a shell command are seen only by the hooks — see below. The
+transcript records the command and never the files it touched, so this channel
+cannot detect them at all.
+
+A `NotebookEdit` is treated as a whole-file write rather than as a cell edit. The
+cell source in the tool call is not what is on disk — the `.ipynb` wraps it in
+JSON with its own escaping and outputs — so replaying it would either fail to
+match or, worse, match by coincidence.
 
 Reading is byte-exact and never gets stuck. A single transcript line can be
 larger than the read window — Claude reading a lockfile, or writing a large file,
@@ -251,6 +339,9 @@ State lives in **VS Code's per-workspace storage**, not in your repository:
 ├── pending/<key>          staging area between the Pre and Post hook
 ├── pending/<key>.json     { path, ts } — expires a staging left by a denied edit
 ├── snapshots/<key>-<ts>   pre-Undo copies, so a destructive action is recoverable
+├── bash/<slot>.json       one shell command's before-state, expiring with the command
+├── bash/repo.json         the cached Git toplevel, so it is not re-derived per call
+├── unreviewable/<key>.json a file the hook could not recover, and why; drained and deleted
 ├── ignore.json            the ignore rules, published for the hook process
 └── events.ndjson          size-capped log of hook events
 ```
@@ -394,6 +485,7 @@ writes ordinary VS Code settings, so nothing there is private to the panel.
 | Setting | Default | Description |
 |---|---|---|
 | `claudeKeepUndo.detection.useHooks` | `true` | Detect edits via Claude Code hooks |
+| `claudeKeepUndo.detection.bashChanges` | `created` | How much of what a shell command changed is captured: `created` (files it creates — reads nothing), `recover` (also files it modifies), `off` |
 | `claudeKeepUndo.detection.useTranscript` | `true` | Detect edits via the session transcript |
 | `claudeKeepUndo.promptToInstallHooks` | `true` | Offer to install the hooks on startup |
 | `claudeKeepUndo.trackOutsideWorkspace` | `false` | Also review files outside the open folder |
@@ -552,8 +644,10 @@ npm test                   # both
 ```
 
 The unit tests cover the diff engine, the transcript baseline reconstruction, how
-transcript tool calls and their results are read, the hook settings merge and
-registration classification, the file IO helpers, the manifest contributions, the
+transcript tool calls and their results are read, the reading of Claude Code's
+own pre-edit copies — including every malformed record that must be refused
+rather than guessed at — the hook settings merge and registration
+classification, the file IO helpers, the manifest contributions, the
 transcript reader driven end to end against real `.jsonl` files, and the
 multi-window behaviour of the temporary `diffEditor.*` overrides. The last two run
 against a stubbed `vscode`, because every failure in the layout group was *between*
@@ -589,6 +683,8 @@ npm run package     # npx @vscode/vsce package
 | `src/detection/transcriptWatcher.ts` | Tails the transcripts, reconstructs baselines |
 | `src/detection/transcriptEvents.ts` | Pure: which tool calls are believed, and when |
 | `src/detection/reconstruct.ts` | Pure, verified baseline reconstruction |
+| `src/detection/fileHistory.ts` | Pure: reading Claude Code's own pre-edit copies |
+| `src/detection/bashSnapshot.ts` | Pure: reading git status, and what a shell command changed |
 | `src/ui/quickDiff.ts` | Source Control + Quick Diff provider (gutter bars, inline widget, pending list) |
 | `src/ui/commentReview.ts` | Optional inline comment threads with Keep/Undo |
 | `src/ui/codeActions.ts` | Keep/Undo as Quick Fixes on the hunk under the cursor |

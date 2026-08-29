@@ -3,12 +3,43 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   extractScriptPath,
-  hookCommand,
-  inspectHooks,
-  MATCHER,
-  mergeHooks,
+  hookCommand as hookCommandRaw,
+  inspectHooks as inspectHooksRaw,
+  matcherFor,
+  ourMatchers,
+  mergeHooks as mergeHooksRaw,
   stripHooks,
 } from "../../detection/hookSettings";
+import { BashMode } from "../../detection/bashSnapshot";
+
+/**
+ * The suite below predates the Bash tier and pins the behaviour that must not
+ * change when it is off, so the mode is bound once here rather than threaded
+ * through every call. Tests that care about the tier pass it explicitly.
+ */
+const DEFAULT_MODE: BashMode = "off";
+const MATCHER = matcherFor(DEFAULT_MODE);
+const hookCommand = (
+  ext: string,
+  state: string,
+  mode: "pre" | "post",
+  root?: string,
+  bash: BashMode = DEFAULT_MODE
+) => hookCommandRaw(ext, state, mode, root, bash);
+const mergeHooks = (
+  settings: Record<string, unknown>,
+  ext: string,
+  state: string,
+  root?: string,
+  bash: BashMode = DEFAULT_MODE
+) => mergeHooksRaw(settings, ext, state, root, bash);
+const inspectHooks = (
+  settings: unknown,
+  ext: string,
+  state: string,
+  root?: string,
+  bash: BashMode = DEFAULT_MODE
+) => inspectHooksRaw(settings, ext, state, root, bash);
 
 // Realistic install layouts, because `isOurInstall` reasons about them: the
 // directory has to sit under some editor's extensions root and outside the
@@ -115,7 +146,7 @@ describe("mergeHooks — matcher reuse", () => {
       hooks: {
         PreToolUse: [
           {
-            matcher: "Edit|Write|MultiEdit",
+            matcher: MATCHER,
             hooks: [{ type: "command", command: "echo mine" }],
           },
         ],
@@ -375,5 +406,114 @@ describe("hook settings of an unexpected shape", () => {
       hooks: { PreToolUse: unknown[] };
     };
     assert.deepEqual(stripped.hooks.PreToolUse, [theirs]);
+  });
+});
+
+describe("matcherFor", () => {
+  it("names every tool explicitly, in a stable order", () => {
+    // Never rely on `Edit` matching `NotebookEdit` as an unanchored substring:
+    // whether Claude Code anchors the regex is not observable from here, and a
+    // wrong guess registers a hook that silently captures nothing.
+    for (const tool of ["Edit", "MultiEdit", "NotebookEdit", "Write"]) {
+      for (const mode of ["off", "created", "recover"] as BashMode[]) {
+        assert.ok(
+          matcherFor(mode).split("|").includes(tool),
+          `${tool} must be its own alternative in the ${mode} matcher`
+        );
+      }
+    }
+  });
+
+  it("includes Bash only when the feature is on", () => {
+    // Claude Code issues roughly twelve Bash calls for every Edit, so an
+    // always-on matcher would spawn node twice per shell command just to decide
+    // it has nothing to do.
+    assert.ok(!matcherFor("off").split("|").includes("Bash"));
+    assert.ok(matcherFor("created").split("|").includes("Bash"));
+    assert.ok(matcherFor("recover").split("|").includes("Bash"));
+  });
+});
+
+describe("the Bash tier and the registration", () => {
+  it("puts the mode in the command, so a change repairs itself", () => {
+    // `inspectHooks` compares the exact command string, so carrying the mode
+    // there is what makes flipping the setting classify the registration stale
+    // and rewrite it. No extra mechanism, and no way for the two to drift.
+    const created = hookCommand(EXT_V1, STATE, "pre", REPO, "created");
+    const recover = hookCommand(EXT_V1, STATE, "pre", REPO, "recover");
+    assert.ok(created.includes("--bash created"));
+    assert.ok(recover.includes("--bash recover"));
+    assert.notEqual(created, recover);
+  });
+
+  it("reports a registration made for a different tier as stale", () => {
+    const settings = mergeHooks({}, EXT_V1, STATE, REPO, "created");
+    assert.equal(inspectHooks(settings, EXT_V1, STATE, REPO, "created"), "ok");
+    assert.equal(
+      inspectHooks(settings, EXT_V1, STATE, REPO, "recover"),
+      "stale",
+      "so repairHooksIfStale rewrites it"
+    );
+    assert.equal(inspectHooks(settings, EXT_V1, STATE, REPO, "off"), "stale");
+  });
+
+  it("migrates an install made before the tier existed", () => {
+    // Every existing user arrives here: their settings hold the old matcher and
+    // a command with no --bash flag. The entry is removed by its command marker,
+    // not by its matcher, which is what keeps the migration clean.
+    const legacy = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "Edit|Write|MultiEdit",
+            hooks: [
+              {
+                type: "command",
+                command: `node "${EXT_V1}/hooks/keepundo-hook.mjs" pre --state "${STATE}"`,
+              },
+            ],
+          },
+        ],
+        PostToolUse: [
+          {
+            matcher: "Edit|Write|MultiEdit",
+            hooks: [
+              {
+                type: "command",
+                command: `node "${EXT_V1}/hooks/keepundo-hook.mjs" post --state "${STATE}"`,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    assert.equal(
+      inspectHooks(legacy, EXT_V1, STATE, REPO, "created"),
+      "stale",
+      "which is what triggers the repair"
+    );
+    const merged = mergeHooks(legacy, EXT_V1, STATE, REPO, "created") as {
+      hooks: Record<string, { matcher?: string; hooks: unknown[] }[]>;
+    };
+    for (const event of ["PreToolUse", "PostToolUse"]) {
+      assert.equal(
+        merged.hooks[event].length,
+        1,
+        `${event} keeps exactly one entry of ours, not an orphaned old one`
+      );
+      assert.equal(merged.hooks[event][0].matcher, matcherFor("created"));
+      assert.equal(merged.hooks[event][0].hooks.length, 1);
+    }
+    assert.equal(inspectHooks(merged, EXT_V1, STATE, REPO, "created"), "ok");
+  });
+
+  it("reports the matchers currently registered", () => {
+    // What tells a path repair from a widening of which tool calls we run on —
+    // the difference between housekeeping and a broader consent.
+    const settings = mergeHooks({}, EXT_V1, STATE, REPO, "off");
+    assert.deepEqual(ourMatchers(settings), [
+      matcherFor("off"),
+      matcherFor("off"),
+    ]);
   });
 });

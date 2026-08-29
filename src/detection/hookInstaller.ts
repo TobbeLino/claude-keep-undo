@@ -1,14 +1,22 @@
 import * as cp from "child_process";
 import * as path from "path";
 import * as vscode from "vscode";
-import { promptToInstallHooks, useHooks } from "../settings";
+import {
+  SECTION,
+  bashChanges,
+  promptToInstallHooks,
+  useHooks,
+} from "../settings";
 import { atomicWrite, readFileResult, removeFile } from "../util";
+import { BashMode } from "./bashSnapshot";
 import {
   hasOurHooks,
   hookCommand,
   HookState,
   inspectHooks,
+  matcherFor,
   mergeHooks,
+  ourMatchers,
   stripHooks,
 } from "./hookSettings";
 
@@ -82,14 +90,22 @@ function readSettingsFile(file: string): SettingsRead {
 function inspectRegistration(
   workspaceRoot: string,
   extensionPath: string,
-  stateDir: string
-): { state: HookState; file: string } {
+  stateDir: string,
+  bash: BashMode
+): { state: HookState; file: string; matchers: string[] } {
   const localFile = localSettingsPath(workspaceRoot);
   const local = readSettingsFile(localFile);
   if (local.kind === "ok" && hasOurHooks(local.value)) {
     return {
-      state: inspectHooks(local.value, extensionPath, stateDir, workspaceRoot),
+      state: inspectHooks(
+        local.value,
+        extensionPath,
+        stateDir,
+        workspaceRoot,
+        bash
+      ),
       file: localFile,
+      matchers: ourMatchers(local.value),
     };
   }
   // An install made by a pre-0.2.0 release lives in the shared file. Report it
@@ -101,23 +117,55 @@ function inspectRegistration(
       shared.value,
       extensionPath,
       stateDir,
-      workspaceRoot
+      workspaceRoot,
+      bash
     );
     return {
       state: state === "foreign" ? "foreign" : "stale",
       file: sharedFile,
+      matchers: ourMatchers(shared.value),
     };
   }
-  return { state: "missing", file: localFile };
+  return { state: "missing", file: localFile, matchers: [] };
 }
 
 /** What is currently wired into this workspace's settings. */
 export function hooksState(
   workspaceRoot: string,
   extensionPath: string,
-  stateDir: string
+  stateDir: string,
+  bash: BashMode
 ): HookState {
-  return inspectRegistration(workspaceRoot, extensionPath, stateDir).state;
+  return inspectRegistration(workspaceRoot, extensionPath, stateDir, bash)
+    .state;
+}
+
+/**
+ * Say, once per workspace, that the hooks now run on shell commands too.
+ *
+ * Silence is right for a path repair — the user consented to the hooks and the
+ * path is an implementation detail — but this changes *which* of Claude Code's
+ * actions run our script, and that is a different question. Dismissable and
+ * remembered, exactly like the foreign-hook warning.
+ */
+function announceBashHooks(dismissals?: vscode.Memento): void {
+  const KEY = "dismissedBashHookNotice";
+  if (dismissals?.get<boolean>(KEY)) {
+    return;
+  }
+  void vscode.window
+    .showInformationMessage(
+      "Keep / Undo now also reviews files Claude changes by running a shell command — sed, redirection, scripts, formatters.",
+      "Settings",
+      "Don't show again"
+    )
+    .then((choice) => {
+      if (choice === "Settings") {
+        void vscode.commands.executeCommand("claudeKeepUndo.openSettings");
+      } else if (choice === "Don't show again") {
+        void dismissals?.update(KEY, true);
+      }
+    });
 }
 
 export type InstallResult =
@@ -130,7 +178,8 @@ export type InstallResult =
 export function installHooks(
   workspaceRoot: string,
   extensionPath: string,
-  stateDir: string
+  stateDir: string,
+  bash: BashMode
 ): InstallResult {
   const file = localSettingsPath(workspaceRoot);
   const read = readSettingsFile(file);
@@ -150,7 +199,13 @@ export function installHooks(
     atomicWrite(`${file}.bak`, read.raw);
   }
 
-  const merged = mergeHooks(current, extensionPath, stateDir, workspaceRoot);
+  const merged = mergeHooks(
+    current,
+    extensionPath,
+    stateDir,
+    workspaceRoot,
+    bash
+  );
   if (!atomicWrite(file, `${JSON.stringify(merged, null, 2)}\n`)) {
     return {
       ok: false,
@@ -159,7 +214,12 @@ export function installHooks(
     };
   }
 
-  removeOurHooksFromSharedSettings(workspaceRoot, extensionPath, stateDir);
+  removeOurHooksFromSharedSettings(
+    workspaceRoot,
+    extensionPath,
+    stateDir,
+    bash
+  );
   return { ok: true };
 }
 
@@ -176,6 +236,7 @@ function removeOurHooksFromSharedSettings(
   workspaceRoot: string,
   extensionPath: string,
   stateDir: string,
+  bash: BashMode,
   log?: (msg: string) => void
 ): boolean {
   const file = sharedSettingsPath(workspaceRoot);
@@ -184,7 +245,7 @@ function removeOurHooksFromSharedSettings(
     return false;
   }
   if (
-    inspectHooks(read.value, extensionPath, stateDir, workspaceRoot) ===
+    inspectHooks(read.value, extensionPath, stateDir, workspaceRoot, bash) ===
     "foreign"
   ) {
     return false;
@@ -209,7 +270,12 @@ export function installHooksInteractive(
   extensionPath: string,
   stateDir: string
 ): boolean {
-  const result = installHooks(workspaceRoot, extensionPath, stateDir);
+  const result = installHooks(
+    workspaceRoot,
+    extensionPath,
+    stateDir,
+    bashChanges()
+  );
   if (result.ok) {
     void vscode.window.showInformationMessage(
       "Claude Code hooks installed in .claude/settings.local.json. Claude's next edits will be detected in real time."
@@ -240,23 +306,32 @@ export function repairHooksIfStale(
   workspaceRoot: string,
   extensionPath: string,
   stateDir: string,
+  bash: BashMode,
   log: (msg: string) => void,
   dismissals?: vscode.Memento
 ): HookState {
-  const { state, file } = inspectRegistration(
+  const { state, file, matchers } = inspectRegistration(
     workspaceRoot,
     extensionPath,
-    stateDir
+    stateDir,
+    bash
   );
   if (state === "stale") {
-    const result = installHooks(workspaceRoot, extensionPath, stateDir);
+    const hadBash = matchers.some((m) => /(^|\|)Bash(\||$)/.test(m));
+    const result = installHooks(workspaceRoot, extensionPath, stateDir, bash);
     log(
       result.ok
         ? "hook command was out of date and has been repaired"
         : `hook command is out of date but could not be repaired: ${result.reason}`
     );
     if (result.ok) {
-      void verifyHookRuns(extensionPath, stateDir, workspaceRoot, log);
+      void verifyHookRuns(extensionPath, stateDir, workspaceRoot, bash, log);
+      // Repairing a path is housekeeping and rightly silent. Widening *which
+      // tool calls* Claude Code runs our script for is a broader consent than
+      // the user gave when they accepted the hooks, so it is said once.
+      if (!hadBash && /(^|\|)Bash(\||$)/.test(matcherFor(bash))) {
+        announceBashHooks(dismissals);
+      }
     }
     return result.ok ? "ok" : "stale";
   }
@@ -268,9 +343,10 @@ export function repairHooksIfStale(
       workspaceRoot,
       extensionPath,
       stateDir,
+      bash,
       log
     );
-    void verifyHookRuns(extensionPath, stateDir, workspaceRoot, log);
+    void verifyHookRuns(extensionPath, stateDir, workspaceRoot, bash, log);
   }
   if (state === "foreign") {
     log(
@@ -303,6 +379,104 @@ export function repairHooksIfStale(
 }
 
 /**
+ * Why shell-command detection cannot work here, or undefined when it can.
+ *
+ * Kept separate from the hook registration because it is a different kind of
+ * failure: the hooks may be installed perfectly and still capture nothing,
+ * because what a shell command changed is worked out from Git.
+ */
+export type BashUnavailable = "no-git" | "not-a-repository";
+
+/**
+ * Ask, once, whether shell-command detection can actually run here.
+ *
+ * Resolved by running `git rev-parse` rather than by looking for a `.git`
+ * directory: that covers a worktree, a submodule and a `.git` file, and it also
+ * answers the other half of the question — whether git can be run at all.
+ */
+export function probeBashDetection(
+  workspaceRoot: string
+): Promise<BashUnavailable | undefined> {
+  return new Promise((resolve) => {
+    let child: cp.ChildProcess;
+    try {
+      child = cp.execFile(
+        "git",
+        ["rev-parse", "--show-toplevel"],
+        { cwd: workspaceRoot, timeout: 5000, windowsHide: true },
+        (error) => {
+          if (!error) {
+            resolve(undefined);
+            return;
+          }
+          // ENOENT is git itself missing; anything else is git saying no.
+          resolve(
+            (error as NodeJS.ErrnoException).code === "ENOENT"
+              ? "no-git"
+              : "not-a-repository"
+          );
+        }
+      );
+    } catch {
+      resolve("no-git");
+      return;
+    }
+    child.on("error", () => resolve("no-git"));
+  });
+}
+
+/**
+ * Say once, per workspace, that files changed by a shell command will not be
+ * detected here.
+ *
+ * Without this the extension is silent about it, and silence is exactly what it
+ * promises not to do: a file Claude changed is either reviewable or listed with
+ * a reason, never simply absent. The diagnostic log said so already, but nobody
+ * reads that.
+ */
+export async function warnIfBashDetectionUnavailable(
+  workspaceRoot: string,
+  bash: BashMode,
+  log: (msg: string) => void,
+  dismissals?: vscode.Memento
+): Promise<void> {
+  if (bash === "off" || !useHooks()) {
+    return; // the user asked for none of this
+  }
+  const problem = await probeBashDetection(workspaceRoot);
+  if (!problem) {
+    return;
+  }
+  const detail =
+    problem === "no-git"
+      ? "Git is not available on the PATH"
+      : "this folder is not a Git repository";
+  log(
+    `files changed by a shell command will not be detected: ${detail}. Everything Claude changes with its edit tools is unaffected.`
+  );
+  const dismissKey = "dismissedBashUnavailableWarning";
+  if (dismissals?.get<boolean>(dismissKey)) {
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `Claude Keep/Undo: files Claude changes by running a shell command will not be detected here, because ${detail}. Edits made with its normal edit tools are unaffected.`,
+    "Turn this off",
+    "Don't warn again"
+  );
+  if (choice === "Turn this off") {
+    await vscode.workspace
+      .getConfiguration(SECTION)
+      .update(
+        "detection.bashChanges",
+        "off",
+        vscode.ConfigurationTarget.Workspace
+      );
+  } else if (choice === "Don't warn again") {
+    await dismissals?.update(dismissKey, true);
+  }
+}
+
+/**
  * Run the hook command once and complain if it cannot start.
  *
  * This is a smoke test, not a faithful reproduction: `cp.exec` inherits the
@@ -324,9 +498,16 @@ async function verifyHookRuns(
   extensionPath: string,
   stateDir: string,
   workspaceRoot: string,
+  bash: BashMode,
   log: (msg: string) => void
 ): Promise<void> {
-  const command = hookCommand(extensionPath, stateDir, "pre", workspaceRoot);
+  const command = hookCommand(
+    extensionPath,
+    stateDir,
+    "pre",
+    workspaceRoot,
+    bash
+  );
   const failure = await new Promise<string | undefined>((resolve) => {
     let child: cp.ChildProcess;
     try {
@@ -375,7 +556,12 @@ export async function maybePromptInstall(
   // rejection rather than as a missing prompt.
   let state: HookState;
   try {
-    state = hooksState(workspaceRoot, context.extensionPath, stateDir);
+    state = hooksState(
+      workspaceRoot,
+      context.extensionPath,
+      stateDir,
+      bashChanges()
+    );
   } catch {
     return;
   }

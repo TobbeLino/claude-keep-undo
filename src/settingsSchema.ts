@@ -350,6 +350,35 @@ export const SETTING_GROUPS: SettingGroup[] = [
         default: true,
       },
       {
+        key: "detection.bashChanges",
+        title: "Files changed by shell commands",
+        detail:
+          "Claude also changes files by running shell commands — sed, a redirect, mv, a formatter, a code generator — and a Bash tool call records only the command, never the files it touched. These tiers say how much is captured. Needs the Claude Code hooks, and works in a Git repository.",
+        type: "enum",
+        default: "created",
+        choices: [
+          {
+            value: "created",
+            label: "Files it creates",
+            detail:
+              "A file that did not exist before the command is reviewable, and Undo deletes it. Exact by construction: no pre-existing file is read. A file the command modified is listed as not reviewable instead.",
+          },
+          {
+            value: "recover",
+            label: "Files it creates and modifies",
+            detail:
+              "Also recovers what a modified file held before the command — from Git for a file that matched the last commit, and from a copy taken beforehand for one that did not. Reads changed files before each command runs.",
+          },
+          {
+            value: "off",
+            label: "Nothing",
+            detail:
+              "Shell commands are ignored entirely, and the hook does not run on them. Files Claude changes this way are not detected at all.",
+          },
+        ],
+        note: "Needs a Git repository: what a command changed is worked out by comparing Git's view of the folder before and after it. Outside one — or with Git unavailable — these changes are not detected, and the extension says so once rather than staying quiet. Excluded files are never read at any tier: the rules are applied before the file is opened, as they are everywhere else.",
+      },
+      {
         key: "detection.useTranscript",
         title: "Use the session transcript",
         detail:

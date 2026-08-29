@@ -2,12 +2,25 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { ChangeStore } from "../changeStore";
-import { claudeProjectsDir, readFileBytesResult, sessionDirFor } from "../util";
+import {
+  claudeFileHistoryDir,
+  claudeProjectsDir,
+  normalizePath,
+  readFileBytesResult,
+  sessionDirFor,
+} from "../util";
+import {
+  backupFilePath,
+  FileBackup,
+  sessionIdForTranscript,
+} from "./fileHistory";
 import { EditEvent, reconstructBaseline } from "./reconstruct";
 import {
   editEventFor,
   filePathOf,
+  mcpWritePathsFrom,
   parseTranscriptLine,
+  transcriptCwdFrom,
   trustWriteSnapshot,
   WriteSnapshotFacts,
 } from "./transcriptEvents";
@@ -40,6 +53,20 @@ interface PendingUse {
   event: EditEvent;
   ts: number;
 }
+
+/**
+ * A file-history announcement, already resolved to something usable.
+ *
+ * The path is worked out when the record is read rather than when the baseline
+ * is needed, because that is the only moment the session the record came from is
+ * known — a subagent's transcript names a different session directory from its
+ * parent's.
+ */
+type ResolvedBackup =
+  /** Claude Code recorded no copy, which it does only when the file was absent. */
+  | { created: true }
+  /** An on-disk copy of the file as it was before the tool ran. */
+  | { created: false; source: string };
 
 /**
  * How long to wait for a tool_result before giving up on a tool call.
@@ -76,8 +103,58 @@ type RegisterOutcome = "registered" | "unreviewable" | "nothing";
  */
 const WRITE_SNAPSHOT_TTL_MS = 60_000;
 
+/**
+ * How deep under the session directory to look for transcripts.
+ *
+ * The sweep used to be flat, and 90% of the transcripts on this machine were
+ * therefore never read: a subagent writes to its own file, nested one to three
+ * levels down, and its tool calls are *not* mirrored into the parent transcript.
+ * Four levels covers the deepest real layout,
+ * `<session>/subagents/workflows/<wf>/agent-<id>.jsonl`.
+ */
+const TRANSCRIPT_MAX_DEPTH = 4;
+
+/**
+ * Directories under the session directory that never hold a transcript.
+ *
+ * Descending into them is not wrong, only wasted: `memory/` is the user's notes
+ * and `tool-results/` holds captured command output, neither of which parses to
+ * a tool call.
+ */
+const SKIPPED_DIRS = new Set(["memory", "tool-results"]);
+
+/**
+ * A workflow's own bookkeeping file. It sits beside the agent transcripts and
+ * carries no tool calls, so reading it is pure cost.
+ */
+const SKIPPED_FILES = new Set(["journal.jsonl"]);
+
+/** How much of a transcript to read when asking which directory it belongs to. */
+const CWD_PROBE_BYTES = 16 * 1024;
+
+/** How long the set of project directories is reused before being rebuilt. */
+const PROJECT_DIRS_TTL_MS = 30_000;
+
 /** How much of a transcript to read in one go. */
 const READ_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * How far the read window will stretch for a single line before giving up.
+ *
+ * A transcript line can genuinely exceed the chunk size — Claude reading a
+ * lockfile, or writing a large file, produces one, and 92 lines in this
+ * developer's history do (the largest 1,358,099 bytes). The window used to be
+ * fixed, so such a line was *skipped*, and a skipped line is the one failure the
+ * reconstruction cannot survive: if it carried an `Edit`'s tool_use while the
+ * matching result was seen, the edit never entered the list, the baseline was
+ * rebuilt from a subset, and replaying that subset forward reproduced the file
+ * exactly — a verified, wrong baseline.
+ *
+ * Stretching to 16 MiB covers every line observed with an order of magnitude to
+ * spare, and the buffer is transient. Beyond it the line is still skipped, but
+ * no longer in silence: see `quarantine`.
+ */
+const MAX_LINE_BYTES = 16 * 1024 * 1024;
 
 /**
  * How many chunks one tick may drain.
@@ -111,12 +188,28 @@ export class TranscriptWatcher implements vscode.Disposable {
   /** Per transcript file, how many bytes we have already consumed. */
   private readonly offsets = new TranscriptOffsets();
   private readonly perFileEdits = new Map<string, EditEvent[]>();
+  /**
+   * Claude Code's own pre-edit copy of each file, resolved to a location on
+   * disk the moment it is announced.
+   *
+   * First one wins, matching `registerBaseline`: across a burst of edits the
+   * baseline has to be the *oldest* pre-Claude state, and the first delta for a
+   * path is exactly that — verified on this machine's history, where a session
+   * emits one delta per path and never more.
+   */
+  private readonly perFileBackups = new Map<string, ResolvedBackup>();
   private readonly writeSnapshots = new Map<string, WriteSnapshot>();
   private readonly registerTimers = new Map<string, NodeJS.Timeout>();
   /** tool_use blocks awaiting their tool_result, by tool_use id. */
   private readonly pendingUse = new Map<string, PendingUse>();
   /** tool_use ids already committed or rejected, so a repeated record is inert. */
   private readonly seenUseIds = new Set<string>();
+  /**
+   * Paths an MCP tool call says it will change, held until its result confirms
+   * it did. There is nothing to reconstruct from — what an MCP server does to a
+   * file is its own business — so these only ever become `noteUnreviewable`.
+   */
+  private readonly pendingMcp = new Map<string, string[]>();
   /**
    * Results whose tool_use has not been parsed yet, by id.
    *
@@ -139,6 +232,18 @@ export class TranscriptWatcher implements vscode.Disposable {
    * handed to the parser.
    */
   private readonly unaligned = new Set<string>();
+  /**
+   * Files whose transcript history is known to have a hole in it.
+   *
+   * Reconstruction is refused for these, because reverse-applying a subset of a
+   * file's edits produces a baseline that passes the forward check and is still
+   * wrong. A *retrieved* baseline is unaffected — a copy Claude Code took is
+   * evidence in its own right, not a replay — so the backup path still runs.
+   */
+  private readonly gapped = new Set<string>();
+  /** Project directories holding this workspace's sessions, and when we last looked. */
+  private projectDirs: string[] = [];
+  private projectDirsAt = 0;
   private lastActivityAt = 0;
   /** Last time any transcript bytes were consumed, for the poll backoff. */
   private lastConsumedAt = 0;
@@ -195,6 +300,7 @@ export class TranscriptWatcher implements vscode.Disposable {
         ...new Set([
           ...this.perFileEdits.keys(),
           ...this.writeSnapshots.keys(),
+          ...this.perFileBackups.keys(),
         ]),
       ]) {
         this.forgetIfResolved(fsPath);
@@ -259,6 +365,8 @@ export class TranscriptWatcher implements vscode.Disposable {
   private forget(fsPath: string): void {
     this.perFileEdits.delete(fsPath);
     this.writeSnapshots.delete(fsPath);
+    this.perFileBackups.delete(fsPath);
+    this.gapped.delete(fsPath);
     for (const [id, pending] of [...this.pendingUse]) {
       if (pending.path === fsPath) {
         this.pendingUse.delete(id);
@@ -276,20 +384,22 @@ export class TranscriptWatcher implements vscode.Disposable {
     if (this.disposed) {
       return;
     }
-    const dir = sessionDirFor(this.cwd);
-    let entries: string[] = [];
-    try {
-      entries = fs
-        .readdirSync(dir)
-        .filter((f) => f.endsWith(".jsonl"))
-        .map((f) => path.join(dir, f));
-    } catch {
-      // The session directory does not exist yet. This still counts as a sweep:
-      // see TranscriptOffsets. Marking it is what makes the transcript of a
-      // session started *after* us get read in full instead of skipped.
+    const dirs = this.sessionDirs();
+    const entries: string[] = [];
+    for (const dir of dirs) {
+      try {
+        entries.push(...listTranscripts(dir));
+      } catch {
+        /* it went away between the listing and the walk */
+      }
+    }
+    if (dirs.length === 0) {
+      // No session directory for this workspace yet. This still counts as a
+      // sweep: see TranscriptOffsets. Marking it is what makes the transcript of
+      // a session started *after* us get read in full instead of skipped.
       this.offsets.sync([], sizeOf);
-      // Watch the parent for the directory being created, so a first-ever
-      // session in this project is picked up immediately rather than whenever the
+      // Watch the parent for a directory being created, so a first-ever session
+      // in this project is picked up immediately rather than whenever the
       // backed-off poll next happens to look.
       this.ensureParentWatcher();
       return;
@@ -301,15 +411,20 @@ export class TranscriptWatcher implements vscode.Disposable {
     this.offsets.sync(entries, sizeOf);
     for (const file of fresh) {
       // Attached at a byte size, which can fall anywhere — including inside a
-      // character. Only offset 0 is a guaranteed line boundary.
-      if (this.offsets.get(file) > 0) {
+      // character. Rather than assume the worst, ask: a transcript is appended
+      // one whole line at a time, so an offset preceded by a newline *is* a line
+      // boundary, and the next read can start there safely. Assuming otherwise
+      // discards the first record after every attach, which on a session joined
+      // mid-flight is a real edit lost for no reason.
+      const offset = this.offsets.get(file);
+      if (offset > 0 && !endsAtLineBoundary(file, offset)) {
         this.unaligned.add(file);
       }
     }
     if (entries.length === 0) {
       return;
     }
-    this.ensureDirWatcher(dir);
+    this.ensureDirWatcher(sessionDirFor(this.cwd));
 
     // Consume every transcript that grew, not just the most recently touched
     // one — parallel sessions and subagents write to their own files.
@@ -318,10 +433,77 @@ export class TranscriptWatcher implements vscode.Disposable {
     }
   }
 
+  /**
+   * Every project directory under ~/.claude/projects whose sessions belong to
+   * this workspace.
+   *
+   * Not derived from the workspace root, because that derivation is lossy in
+   * both directions. Claude Code encodes the cwd by replacing every
+   * non-alphanumeric character with a dash, so `…/Erogatore_Contalitri` and
+   * `…/Erogatore-Contalitri` land in the same folder — this machine has exactly
+   * such a pair — and a session started from a *subdirectory* of the workspace
+   * lands in a folder the derivation never looks at, which is a total and silent
+   * miss. Each candidate is asked which cwd it holds instead.
+   *
+   * A directory whose transcripts do not state a cwd falls back to the old rule
+   * — name matches the encoded root — so an unreadable or changed format loses
+   * nothing that used to work.
+   *
+   * Rebuilt at most every PROJECT_DIRS_TTL_MS: it is a readdir plus a short read
+   * per candidate, which is cheap but not free, and directories appear rarely.
+   */
+  private sessionDirs(): string[] {
+    const now = Date.now();
+    if (
+      this.projectDirs.length > 0 &&
+      now - this.projectDirsAt < PROJECT_DIRS_TTL_MS
+    ) {
+      return this.projectDirs;
+    }
+    const root = sessionDirFor(this.cwd);
+    const found: string[] = [];
+    let candidates: fs.Dirent[] = [];
+    try {
+      candidates = fs.readdirSync(claudeProjectsDir(), { withFileTypes: true });
+    } catch {
+      candidates = [];
+    }
+    for (const entry of candidates) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const dir = path.join(claudeProjectsDir(), entry.name);
+      const owner = probeTranscriptCwd(dir);
+      if (owner === undefined) {
+        // Nothing to ask. Keep it only if the old derivation picked it.
+        if (dir === root) {
+          found.push(dir);
+        }
+        continue;
+      }
+      if (ownsPath(this.cwd, owner)) {
+        found.push(dir);
+      }
+    }
+    this.projectDirs = found;
+    this.projectDirsAt = now;
+    return found;
+  }
+
   private ensureDirWatcher(dir: string): void {
     if (this.dirWatcher) {
       return;
     }
+    // Deliberately NOT recursive, even though the transcripts that matter most
+    // now live in subdirectories. On macOS `{recursive:true}` switches this to
+    // FSEvents, whose coalesced, delayed callbacks fire `tick()` again after the
+    // transcript has gone quiet — which pushes `lastActivityAt` forward and
+    // defers the reconstruction that was about to run. The poll already covers
+    // the nested files: `lastConsumedAt` counts bytes read from *any*
+    // transcript, so the first tick that reads a subagent's file pulls the
+    // interval back down to POLL_MIN_MS and holds it there while it is active.
+    // The cost is bounded by one poll period at the start of a subagent's work;
+    // the alternative cost was a detector that reschedules itself.
     try {
       this.dirWatcher = fs.watch(dir, () => this.tick());
     } catch {
@@ -377,53 +559,58 @@ export class TranscriptWatcher implements vscode.Disposable {
     if (size < offset) {
       // Truncated or replaced: re-attach at the end rather than replaying it.
       this.offsets.set(file, size);
-      this.unaligned.add(file);
+      if (size > 0 && !endsAtLineBoundary(file, size)) {
+        this.unaligned.add(file);
+      }
+      this.log(
+        `${path.basename(file)} shrank; re-attaching at its new end (${size} bytes)`
+      );
       return false;
     }
     if (size === offset) {
       return false;
     }
 
-    const length = Math.min(size - offset, READ_CHUNK_BYTES);
-    let fd: number | undefined;
+    const tail = size - offset;
+    let length = Math.min(tail, READ_CHUNK_BYTES);
     let view: Buffer | undefined;
-    try {
-      fd = fs.openSync(file, "r");
-      const buf = Buffer.allocUnsafe(length);
-      const read = fs.readSync(fd, buf, 0, length, offset);
-      // allocUnsafe leaves anything past `read` uninitialised, so every scan and
-      // every decode below has to be bounded by what was actually read.
-      view = buf.subarray(0, read);
-    } catch {
-      return false;
-    } finally {
-      if (fd !== undefined) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* ignore */
-        }
+    let lastNl = -1;
+    // Stretch the window until it holds a line boundary. A line longer than the
+    // chunk is real and must not be dropped, so the read is retried at a larger
+    // size rather than abandoned — up to the point where holding it in memory
+    // stops being reasonable.
+    for (;;) {
+      view = readAt(file, offset, length);
+      if (view === undefined) {
+        return false;
       }
-    }
-    if (view.length === 0) {
-      return false;
+      if (view.length === 0) {
+        return false;
+      }
+      lastNl = view.lastIndexOf(0x0a);
+      if (lastNl >= 0 || length >= tail || length >= MAX_LINE_BYTES) {
+        break;
+      }
+      length = Math.min(tail, Math.min(MAX_LINE_BYTES, length * 4));
     }
 
-    const lastNl = view.lastIndexOf(0x0a);
     if (lastNl < 0) {
-      if (length >= size - offset) {
+      if (length >= tail) {
         // The window covered the whole tail, so the missing newline just means
         // the last line is still being appended. Wait for the rest of it.
         return false;
       }
-      // A single line longer than the chunk. Skipping it is the only option that
-      // keeps the watcher alive: leaving the offset where it is re-reads the same
-      // chunk on every tick forever — synchronously, on the extension-host
-      // thread — and every later edit in the session becomes invisible with no
-      // error and no warning.
+      // A line larger than any window we are willing to hold. It still has to be
+      // skipped — leaving the offset put would re-read the same bytes on every
+      // tick forever, synchronously, on the extension-host thread — but the
+      // files whose history it may have carried are quarantined rather than
+      // reconstructed from what is left.
       this.offsets.set(file, offset + view.length);
       this.unaligned.add(file);
-      this.log(`skipping an oversized line in ${path.basename(file)}`);
+      this.log(
+        `a line in ${path.basename(file)} is larger than ${MAX_LINE_BYTES} bytes and cannot be read`
+      );
+      this.quarantine();
       return true;
     }
 
@@ -441,19 +628,57 @@ export class TranscriptWatcher implements vscode.Disposable {
 
     for (const line of consumable.split("\n")) {
       if (line.trim()) {
-        this.handleLine(line);
+        this.handleLine(line, file);
       }
     }
     return next < size;
   }
 
-  private handleLine(line: string): void {
+  /**
+   * Give up on reconstructing every file currently in flight, because part of
+   * the transcript could not be read and any one of them may be missing an edit.
+   *
+   * Marked rather than dropped: the changes view lists these with the reason, so
+   * a file Claude touched never disappears in silence. A file that later turns
+   * out to have a copy Claude Code took is still registered exactly — the
+   * quarantine forbids the *guess*, not the evidence.
+   */
+  private quarantine(): void {
+    const affected = new Set<string>([
+      ...this.perFileEdits.keys(),
+      ...this.writeSnapshots.keys(),
+      ...[...this.pendingUse.values()].map((p) => p.path),
+    ]);
+    for (const fsPath of affected) {
+      this.gapped.add(fsPath);
+      if (!this.store.hasBaseline(fsPath) && !this.perFileBackups.has(fsPath)) {
+        this.unreviewable(
+          fsPath,
+          "part of the session transcript could not be read, so what Claude changed in this file is not known exactly"
+        );
+      }
+    }
+  }
+
+  private handleLine(line: string, file: string): void {
     const parsed = parseTranscriptLine(line);
     if (!parsed) {
       return;
     }
+    // Before the tool calls, so that a delta and the edit it belongs to landing
+    // in the same chunk are recorded in the order they happened.
+    for (const backup of parsed.backups) {
+      this.handleBackup(backup, file);
+    }
     for (const use of parsed.uses) {
-      this.handleToolUse(use.name, use.input, use.id, parsed.timestamp);
+      this.handleMcpUse(use.name, use.input, use.id);
+      this.handleToolUse(
+        use.name,
+        use.input,
+        use.id,
+        parsed.timestamp,
+        parsed.cwd
+      );
     }
     // Results live in a *user* message, which is why they used to be invisible
     // here: the loop only ever looked at tool_use blocks.
@@ -462,18 +687,99 @@ export class TranscriptWatcher implements vscode.Disposable {
     }
   }
 
+  /**
+   * Record where Claude Code put its copy of a file, before anything is read.
+   *
+   * Scope and the ignore rules are checked here for the same reason
+   * `handleToolUse` checks them at the top: a copy of an excluded file is still
+   * a copy of it, and the promise in the README is that a `.keepundoignore`d
+   * path is never read at all. Nothing below opens the backup — that happens
+   * only if and when a baseline is actually needed for the path.
+   */
+  private handleBackup(backup: FileBackup, file: string): void {
+    if (
+      !this.store.isInScope(backup.path) ||
+      this.store.isIgnored(backup.path)
+    ) {
+      return;
+    }
+    if (this.perFileBackups.has(backup.path)) {
+      return; // the first copy is the oldest pre-Claude state; keep it
+    }
+    if (backup.kind === "created") {
+      this.perFileBackups.set(backup.path, { created: true });
+      return;
+    }
+    const projectDir = projectDirOf(file);
+    const sessionId =
+      projectDir === undefined
+        ? undefined
+        : sessionIdForTranscript(projectDir, file);
+    if (sessionId === undefined) {
+      return;
+    }
+    const source = backupFilePath(
+      claudeFileHistoryDir(),
+      sessionId,
+      backup.name
+    );
+    if (source === undefined) {
+      return;
+    }
+    this.perFileBackups.set(backup.path, { created: false, source });
+  }
+
+  /**
+   * Note the files an MCP tool call claims it will write.
+   *
+   * Held rather than acted on: the call is announced before it runs, and a
+   * server that fails must not leave a file listed as changed. Nothing is read
+   * and nothing is reconstructed — an MCP server's edit semantics are its own,
+   * so the only honest outcome is a listed file with an explanation, which is
+   * still strictly better than the silence there is today.
+   */
+  private handleMcpUse(
+    name: string,
+    input: Record<string, unknown>,
+    id: string | undefined
+  ): void {
+    if (id === undefined || this.seenUseIds.has(id)) {
+      return;
+    }
+    const paths = mcpWritePathsFrom(name, input).filter(
+      (p) => this.store.isInScope(p) && !this.store.isIgnored(p)
+    );
+    if (paths.length > 0) {
+      this.pendingMcp.set(id, paths);
+      this.lastActivityAt = Date.now();
+    }
+  }
+
   private handleToolUse(
     name: string,
     input: Record<string, unknown>,
     id: string | undefined,
-    toolTs: number | undefined
+    toolTs: number | undefined,
+    lineCwd: string | undefined
   ): void {
     let filePath = filePathOf(input);
     if (!filePath) {
       return;
     }
     if (!path.isAbsolute(filePath)) {
-      filePath = path.resolve(this.cwd, filePath);
+      // Resolved against the cwd *the line recorded*, never the workspace root.
+      // The shell's `cd` persists across Bash calls, so the two diverge within a
+      // single session — one session here records 13 distinct values — and
+      // resolving against the wrong one registers the baseline onto a different
+      // file, which is the data-loss class. With no cwd on the line there is
+      // nothing to resolve against, and guessing is worse than skipping: every
+      // file_path observed in 4,475 real tool calls was already absolute, so
+      // this refusal costs nothing that works today.
+      if (lineCwd === undefined) {
+        this.log(`ignoring a relative path with no recorded cwd: ${filePath}`);
+        return;
+      }
+      filePath = path.resolve(lineCwd, filePath);
     }
     // Claude edits files outside the open folder all the time — its own
     // settings, a scratch file in /tmp, a sibling repository it was asked to
@@ -544,7 +850,7 @@ export class TranscriptWatcher implements vscode.Disposable {
     if (this.seenUseIds.has(id)) {
       return; // already settled; a repeated result record must not commit twice
     }
-    if (!this.pendingUse.has(id)) {
+    if (!this.pendingUse.has(id) && !this.pendingMcp.has(id)) {
       // Out-of-order line: remember the verdict for when the call turns up.
       if (this.earlyResults.size >= SEEN_IDS_MAX) {
         const oldest = this.earlyResults.keys().next();
@@ -559,6 +865,20 @@ export class TranscriptWatcher implements vscode.Disposable {
   }
 
   private settlePending(id: string, failed: boolean): void {
+    const mcp = this.pendingMcp.get(id);
+    if (mcp) {
+      this.pendingMcp.delete(id);
+      if (!failed) {
+        for (const fsPath of mcp) {
+          if (!this.store.hasBaseline(fsPath)) {
+            this.unreviewable(
+              fsPath,
+              "it was changed by an MCP tool, whose content before the change was not captured"
+            );
+          }
+        }
+      }
+    }
     const pending = this.pendingUse.get(id);
     if (!pending) {
       return;
@@ -771,6 +1091,35 @@ export class TranscriptWatcher implements vscode.Disposable {
     }
     const current = read.kind === "ok" ? read.text : "";
 
+    // Claude Code's own copy of the file, taken before the tool ran. Tried
+    // before reconstruction because it is a *retrieval*: none of reverse-apply's
+    // refusals apply to it, and neither does its one silent failure — an edit
+    // that never reached us produces a subset that replays forward cleanly and
+    // yields the wrong baseline.
+    const fromBackup = this.baselineFromBackup(filePath);
+    if (fromBackup !== undefined) {
+      this.store.registerBaseline(filePath, fromBackup.baseline, {
+        created: fromBackup.created,
+      });
+      this.log(
+        fromBackup.created
+          ? `${filePath} did not exist before Claude Code touched it: Undo will delete it`
+          : `baseline read from Claude Code's own pre-edit copy of ${filePath}`
+      );
+      return "registered";
+    }
+
+    if (this.gapped.has(filePath)) {
+      // No copy was available above, and this file's edit list is known to be
+      // incomplete. Reverse-applying it would produce a baseline that verifies
+      // and is wrong, which is the one outcome worse than saying nothing.
+      this.store.noteUnreviewable(
+        filePath,
+        "part of the session transcript could not be read, so what Claude changed in this file is not known exactly"
+      );
+      return "unreviewable";
+    }
+
     const result = reconstructBaseline(events, current);
     if (result.kind === "ok") {
       this.store.registerBaseline(filePath, result.baseline);
@@ -801,6 +1150,46 @@ export class TranscriptWatcher implements vscode.Disposable {
     this.store.noteUnreviewable(filePath, result.reason);
     this.notifyOnce();
     return "unreviewable";
+  }
+
+  /**
+   * The baseline Claude Code's own backup gives for this file, if it gives one.
+   *
+   * Returns undefined rather than a guess in every doubtful case, so the caller
+   * falls through to reconstruction: a pruned backup (Claude Code cleans these
+   * up, so a missing file is *no evidence*, never "it was empty"), one that is
+   * not UTF-8 text, or one that cannot be read at all.
+   */
+  private baselineFromBackup(
+    filePath: string
+  ): { baseline: string; created: boolean } | undefined {
+    const backup = this.perFileBackups.get(filePath);
+    if (!backup) {
+      return undefined;
+    }
+    if (backup.created) {
+      // No copy was taken because there was nothing to copy. That is a statement
+      // about the file, not a gap in the record, so the whole file is an
+      // addition and no read is needed to establish it.
+      return { baseline: "", created: true };
+    }
+    // Asked again, immediately before the read. `handleBackup` already refused an
+    // excluded path, but that was up to a settle period earlier and the rules are
+    // live: a `.keepundoignore` saved in the meantime, or a path added through
+    // *Ignore this file*, must take effect on the copy as well as on the file.
+    // `registerBaseline` checks too, but by then the content is already in
+    // memory, and the promise made for a `.env` is that it is never read.
+    if (this.store.isIgnored(filePath) || !this.store.isInScope(filePath)) {
+      return undefined;
+    }
+    const read = readFileBytesResult(backup.source);
+    if (read.kind !== "ok") {
+      this.log(
+        `Claude Code's pre-edit copy of ${filePath} is ${read.kind}; falling back to reconstruction`
+      );
+      return undefined;
+    }
+    return { baseline: read.text, created: false };
   }
 
   private unreviewable(filePath: string, reason: string): void {
@@ -861,8 +1250,155 @@ export class TranscriptWatcher implements vscode.Disposable {
     }
     this.registerTimers.clear();
     this.pendingUse.clear();
+    this.pendingMcp.clear();
     this.earlyResults.clear();
     this.storeListener.dispose();
+  }
+}
+
+/**
+ * Every transcript under a session directory, including the ones a subagent
+ * writes.
+ *
+ * The first `readdirSync` is deliberately left to throw: the caller reads that
+ * as "this project has never run Claude Code" and arms the parent watcher.
+ * Every deeper read swallows its own error instead, because a directory that
+ * disappears mid-walk — a workflow cleaning up after itself — must not abort a
+ * sweep that has already found other files.
+ */
+function listTranscripts(root: string): string[] {
+  const out: string[] = [];
+  walkTranscripts(root, fs.readdirSync(root, { withFileTypes: true }), 0, out);
+  return out;
+}
+
+function walkTranscripts(
+  dir: string,
+  entries: fs.Dirent[],
+  depth: number,
+  out: string[]
+): void {
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      // `isDirectory` is false for a symlink, which is what keeps a link back up
+      // the tree from turning this into an infinite walk.
+      if (depth >= TRANSCRIPT_MAX_DEPTH || SKIPPED_DIRS.has(entry.name)) {
+        continue;
+      }
+      let children: fs.Dirent[];
+      try {
+        children = fs.readdirSync(full, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      walkTranscripts(full, children, depth + 1, out);
+    } else if (
+      entry.isFile() &&
+      entry.name.endsWith(".jsonl") &&
+      !SKIPPED_FILES.has(entry.name)
+    ) {
+      out.push(full);
+    }
+  }
+}
+
+/**
+ * Which project directory a transcript sits under — the first path segment below
+ * ~/.claude/projects, whatever depth the file itself is at.
+ */
+function projectDirOf(file: string): string | undefined {
+  const projects = claudeProjectsDir();
+  const rel = path.relative(projects, file);
+  if (rel === "" || path.isAbsolute(rel)) {
+    return undefined;
+  }
+  const [first] = rel.split(path.sep);
+  if (!first || first === "." || first === "..") {
+    return undefined;
+  }
+  return path.join(projects, first);
+}
+
+/**
+ * The cwd the transcripts in this directory were recorded against, or undefined
+ * when none of them says.
+ *
+ * Only the first transcript is asked, and only its opening bytes: every session
+ * in a directory was launched from the same cwd by construction — the directory
+ * name *is* that cwd, encoded — so one answer settles it.
+ */
+function probeTranscriptCwd(dir: string): string | undefined {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    return undefined;
+  }
+  for (const name of names.sort()) {
+    const head = readAt(path.join(dir, name), 0, CWD_PROBE_BYTES);
+    if (head === undefined || head.length === 0) {
+      continue;
+    }
+    const cwd = transcriptCwdFrom(head.toString("utf8"));
+    if (cwd !== undefined) {
+      return cwd;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Does `root` contain `candidate` — or are they the same directory?
+ *
+ * A session launched inside the workspace belongs to it; one launched in a
+ * parent, or in a sibling that merely encodes to a similar name, does not.
+ */
+function ownsPath(root: string, candidate: string): boolean {
+  const rel = path.relative(normalizePath(root), normalizePath(candidate));
+  if (rel === "") {
+    return true;
+  }
+  return (
+    !path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`)
+  );
+}
+
+/**
+ * Is `offset` immediately after a newline, and therefore the start of a line?
+ *
+ * One byte read. Answers exactly rather than conservatively, which is what lets
+ * an attach mid-file keep the record that follows it.
+ */
+function endsAtLineBoundary(file: string, offset: number): boolean {
+  const byte = readAt(file, offset - 1, 1);
+  return byte !== undefined && byte.length === 1 && byte[0] === 0x0a;
+}
+
+/** One positioned read, or undefined if the file could not be read. */
+function readAt(
+  file: string,
+  offset: number,
+  length: number
+): Buffer | undefined {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.allocUnsafe(length);
+    const read = fs.readSync(fd, buf, 0, length, offset);
+    // allocUnsafe leaves anything past `read` uninitialised, so every scan and
+    // every decode by the caller has to be bounded by what was actually read.
+    return buf.subarray(0, read);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }
 

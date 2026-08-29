@@ -22,6 +22,12 @@
 
 <br/>
 
+<p align="center">
+  <img src="showcase.gif" width="1000" alt="Claude edits a file; coloured bars appear in the gutter, and each change is kept or undone from the Quick Diff widget without leaving the editor.">
+</p>
+
+<br/>
+
 > **Unofficial.** This is a community project. It is not affiliated with,
 > endorsed by, or sponsored by Anthropic. *Claude* and *Claude Code* are
 > trademarks of Anthropic, PBC.
@@ -60,8 +66,15 @@ baseline and file agree, the file leaves the review queue.
   the syntax you already know from `.gitignore`. An ignored file is not detected,
   not queued, and — because the rule is enforced inside the hook too — never read
   or copied aside. That last part is the point for a `.env`.
-- **Zero-config, or exact.** It works from the session transcript alone; install
-  the Claude Code hooks for precise real-time baselines and full coverage.
+- **Shell commands too.** Claude does not only use its edit tools: it runs
+  `sed -i`, redirects into a file, moves things, runs a formatter or a code
+  generator. Those changes are reviewed like any other — a file the command
+  created can be undone away, and one it modified is restored to what it held
+  before, recovered from Git or from a copy taken beforehand.
+- **Zero-config, or exact.** It works from the session transcript alone — reading
+  Claude Code's own pre-edit copy of a file where there is one, including the
+  files a subagent changed — and installing the Claude Code hooks adds precise
+  real-time baselines and full coverage.
 - **Fully local, stable API only.** No network calls, no telemetry, no account,
   no proposed APIs. State survives a reload and lives outside your repository.
 
@@ -126,8 +139,12 @@ reference, and each one is a constraint of VS Code's **stable** extension API:
   and are not exposed to extensions at all.
 - In a Git repository you may see two sets of gutter bars, and a second
   *Claude Changes* entry appears in the Source Control view.
-- Without the hooks, some edits — every `replace_all` among them — cannot be
-  reconstructed exactly and are listed rather than reviewed.
+- Without the hooks, an edit whose original cannot be established exactly is
+  listed with an explanation rather than reviewed.
+- Reviewing what a shell command changed needs the hooks **and a Git
+  repository**. Outside one, or with Git unavailable, those changes are not
+  detected — the extension says so once instead of leaving the queue quietly
+  empty. Claude's ordinary edit tools are unaffected either way.
 - UTF-8 text only, single-root workspaces only.
 
 ## Privacy

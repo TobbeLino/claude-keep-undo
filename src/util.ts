@@ -46,6 +46,33 @@ export function sessionDirFor(cwd: string): string {
   return path.join(claudeProjectsDir(), encodeProjectDir(cwd));
 }
 
+/** Per-Bash-call snapshots, and the cached git toplevel. */
+export function bashDir(stateDir: string): string {
+  return path.join(stateDir, "bash");
+}
+
+/**
+ * Notes the hook leaves for files it could not establish a baseline for.
+ *
+ * The hook runs in its own process and cannot call `noteUnreviewable`, so the
+ * explanation goes on disk and the extension drains it. Without this a file
+ * changed by a shell command whose original was unrecoverable would simply be
+ * absent from the review queue — indistinguishable, to the user, from Claude
+ * not having touched it.
+ */
+export function unreviewableDir(stateDir: string): string {
+  return path.join(stateDir, "unreviewable");
+}
+
+/**
+ * Where Claude Code keeps its own pre-edit copies of the files it changes,
+ * one directory per session. See detection/fileHistory.ts for what lives there
+ * and why it is the most faithful baseline available.
+ */
+export function claudeFileHistoryDir(): string {
+  return path.join(os.homedir(), ".claude", "file-history");
+}
+
 // --- shared on-disk layout ------------------------------------------------
 //
 // <stateDir>/                       (VS Code's per-workspace storage, NOT the repo)
@@ -115,6 +142,21 @@ export interface Sidecar {
    * Absent in records written before 1.1.1.
    */
   bytes?: number;
+  /**
+   * How long this staging stays valid, when it is not the global default.
+   *
+   * Only a Bash staging records one. A shell command may legitimately run for
+   * minutes — the tool's own default timeout is double the 60 s staging TTL, and
+   * 1.80% of real calls exceed it — so its copy has to outlive that TTL or the
+   * command's own Post finds it expired. Raising the global TTL instead is not
+   * an option: those 60 s are what stop a denied Edit's staging from being
+   * promoted as the "original" for an edit made days later.
+   *
+   * Its presence also marks the staging as a Bash one, which is what lets the
+   * sweep report an interrupted command without saying anything about an
+   * ordinary expired Edit staging.
+   */
+  ttlMs?: number;
 }
 
 export function readSidecar(contentPath: string): Sidecar | undefined {
@@ -139,6 +181,9 @@ export function readSidecar(contentPath: string): Sidecar | undefined {
       // recorded" (a pre-1.1.1 sidecar) from any value, including zero.
       if (typeof value.bytes === "number") {
         record.bytes = value.bytes;
+      }
+      if (typeof value.ttlMs === "number") {
+        record.ttlMs = value.ttlMs;
       }
       return record;
     }

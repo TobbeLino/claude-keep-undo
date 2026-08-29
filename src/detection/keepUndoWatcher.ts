@@ -1,6 +1,31 @@
+import * as path from "path";
 import * as vscode from "vscode";
 import { ChangeStore } from "../changeStore";
-import { readSidecar } from "../util";
+import {
+  listDir,
+  readFileSafe,
+  readSidecar,
+  removeFile,
+  unreviewableDir,
+} from "../util";
+
+/**
+ * A note the hook left about a file it could not establish a baseline for.
+ *
+ * It runs in its own process and cannot call into the extension, so the
+ * explanation is written to disk and drained here. Transient by design, matching
+ * `ChangeStore.unreviewable`, which is an in-memory map wiped on reload: the
+ * note is read, handed to the store, and deleted.
+ */
+interface UnreviewableNote {
+  path: string;
+  reason: string;
+  remedy?: string;
+  ts: number;
+}
+
+/** A note older than this is stale bookkeeping, not a pending explanation. */
+const NOTE_TTL_MS = 24 * 3600_000;
 
 /**
  * Watches the baselines directory and refreshes the store when the hooks write
@@ -30,15 +55,21 @@ export class KeepUndoWatcher implements vscode.Disposable {
   private readonly touched = new Set<string>();
   private needsFullRefresh = false;
 
+  private readonly notesDir: string;
+
   constructor(
     stateDir: string,
     private readonly store: ChangeStore
   ) {
+    this.notesDir = unreviewableDir(stateDir);
     const pattern = new vscode.RelativePattern(
       vscode.Uri.file(stateDir),
-      "baselines/**"
+      "{baselines,unreviewable}/**"
     );
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    // Notes written while this window was closed, or before the watcher was
+    // wired up, would otherwise sit on disk unread.
+    this.drainNotes();
     this.watcher.onDidCreate((uri) => this.note(uri));
     this.watcher.onDidChange((uri) => this.note(uri));
     this.watcher.onDidDelete(() => {
@@ -56,6 +87,10 @@ export class KeepUndoWatcher implements vscode.Disposable {
     const fsPath = uri.fsPath;
     if (fsPath.endsWith(".tmp")) {
       return; // an atomicWrite in flight; the rename fires its own event
+    }
+    if (fsPath.startsWith(this.notesDir + path.sep)) {
+      this.drainNotes();
+      return;
     }
     this.touched.add(
       fsPath.endsWith(".json") ? fsPath.slice(0, -".json".length) : fsPath
@@ -97,6 +132,52 @@ export class KeepUndoWatcher implements vscode.Disposable {
     // Rather than lose it, fall back to the sweep that finds everything.
     if (resolved < touched.length) {
       this.store.refreshFromDisk();
+    }
+  }
+
+  /**
+   * Read every note the hook left, hand it to the store, and delete it.
+   *
+   * A note whose file already has a baseline is dropped without being ingested:
+   * a later command may have recovered it exactly, and the changes view lists
+   * tracked files and unreviewable ones separately, so keeping both would show
+   * the same file twice.
+   */
+  private drainNotes(): void {
+    for (const entry of listDir(this.notesDir)) {
+      if (!entry.endsWith(".json")) {
+        continue;
+      }
+      const file = path.join(this.notesDir, entry);
+      const raw = readFileSafe(file);
+      if (raw === undefined) {
+        continue;
+      }
+      let note: UnreviewableNote | undefined;
+      try {
+        const parsed = JSON.parse(raw) as UnreviewableNote;
+        note =
+          parsed &&
+          typeof parsed.path === "string" &&
+          typeof parsed.reason === "string"
+            ? parsed
+            : undefined;
+      } catch {
+        note = undefined;
+      }
+      // Removed either way: an unparseable note is not going to become readable,
+      // and one that has been acted on is spent.
+      removeFile(file);
+      if (!note || Date.now() - (Number(note.ts) || 0) > NOTE_TTL_MS) {
+        continue;
+      }
+      if (this.store.hasBaseline(note.path)) {
+        continue; // recovered exactly after all
+      }
+      this.store.noteUnreviewable(
+        note.path,
+        note.remedy ? `${note.reason}. ${note.remedy}` : note.reason
+      );
     }
   }
 
