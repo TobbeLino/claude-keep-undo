@@ -540,32 +540,37 @@ async function verifyHookRuns(
 }
 
 /**
- * On activation, offer to install the hooks if they are missing. Honors the
- * "promptToInstallHooks" setting and remembers a per-workspace dismissal.
+ * On activation, offer to install the hooks if they are missing in any of the
+ * given projects. Honors the "promptToInstallHooks" setting and remembers a
+ * per-workspace dismissal.
  */
 export async function maybePromptInstall(
   context: vscode.ExtensionContext,
-  workspaceRoot: string,
-  stateDir: string
+  targets: { workspaceRoot: string; stateDir: string }[]
 ): Promise<void> {
-  if (!promptToInstallHooks() || !useHooks()) {
+  if (!promptToInstallHooks() || !useHooks() || targets.length === 0) {
     return;
   }
   // Guarded like every other read of the registration: this one is awaited from
   // activation with no catch, so a throw here would surface as an unhandled
   // rejection rather than as a missing prompt.
-  let state: HookState;
-  try {
-    state = hooksState(
-      workspaceRoot,
-      context.extensionPath,
-      stateDir,
-      bashChanges()
-    );
-  } catch {
-    return;
+  const missing: { workspaceRoot: string; stateDir: string }[] = [];
+  for (const target of targets) {
+    try {
+      const state = hooksState(
+        target.workspaceRoot,
+        context.extensionPath,
+        target.stateDir,
+        bashChanges()
+      );
+      if (state === "missing") {
+        missing.push(target);
+      }
+    } catch {
+      continue;
+    }
   }
-  if (state !== "missing") {
+  if (missing.length === 0) {
     return;
   }
   const dismissKey = "dismissedHookPrompt";
@@ -573,14 +578,61 @@ export async function maybePromptInstall(
     return;
   }
 
+  const message =
+    missing.length === 1
+      ? "Keep / Undo for Claude Code: install the Claude Code hooks in this project? They give exact baselines; without them some of Claude's edits cannot be reconstructed and are not offered for review."
+      : `Keep / Undo for Claude Code: install the Claude Code hooks in ${missing.length} projects? They give exact baselines; without them some of Claude's edits cannot be reconstructed and are not offered for review.`;
+
   const choice = await vscode.window.showInformationMessage(
-    "Keep / Undo for Claude Code: install the Claude Code hooks in this project? They give exact baselines; without them some of Claude's edits cannot be reconstructed and are not offered for review.",
+    message,
     "Install",
     "Transcript only",
     "Don't ask again"
   );
   if (choice === "Install") {
-    installHooksInteractive(workspaceRoot, context.extensionPath, stateDir);
+    if (missing.length === 1) {
+      installHooksInteractive(
+        missing[0].workspaceRoot,
+        context.extensionPath,
+        missing[0].stateDir
+      );
+    } else {
+      let failed: Extract<InstallResult, { ok: false }> | undefined;
+      let ok = 0;
+      for (const target of missing) {
+        const result = installHooks(
+          target.workspaceRoot,
+          context.extensionPath,
+          target.stateDir,
+          bashChanges()
+        );
+        if (result.ok) {
+          ok++;
+        } else {
+          failed = result;
+        }
+      }
+      if (ok === missing.length) {
+        void vscode.window.showInformationMessage(
+          `Claude Code hooks installed in ${missing.length} projects. Claude's next edits will be detected in real time.`
+        );
+      } else if (failed) {
+        void vscode.window
+          .showErrorMessage(
+            `Could not install the Claude Code hooks in ${
+              missing.length - ok
+            } of ${missing.length} projects: ${failed.reason}.`,
+            "Open settings file"
+          )
+          .then((open) => {
+            if (open === "Open settings file") {
+              void vscode.window.showTextDocument(
+                vscode.Uri.file(failed.settingsFile)
+              );
+            }
+          });
+      }
+    }
   } else if (choice === "Don't ask again" || choice === "Transcript only") {
     await context.workspaceState.update(dismissKey, true);
   }

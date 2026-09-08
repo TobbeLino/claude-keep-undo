@@ -32,7 +32,8 @@ extension.
 | Node.js | `>= 18` on your `PATH` — required by the hook script (see below) |
 | Claude Code | Any version that writes session transcripts to `~/.claude/projects` and supports `PreToolUse`/`PostToolUse` hooks |
 
-A workspace folder must be open; the extension is a no-op in an empty window.
+A workspace folder must be open; multi-root workspaces are supported, with
+each folder keeping its own review queue.
 
 ---
 
@@ -330,10 +331,12 @@ if one already exists, so the transcript path only fills gaps.
 
 ## On-disk state
 
-State lives in **VS Code's per-workspace storage**, not in your repository:
+State lives in **VS Code's global storage**, keyed by the folder path — not by
+the window — so the same repo keeps its review queue when opened alone or in
+another workspace:
 
 ```
-<VS Code workspace storage>/FedeFluork.claude-keep-undo/
+<VS Code globalStorage>/FedeFluork.claude-keep-undo/folders/<folder-key>/
 ├── baselines/<key>        original (pre-Claude) content, published after the edit
 ├── baselines/<key>.json   { path, ts } — makes each baseline self-describing
 ├── pending/<key>          staging area between the Pre and Post hook
@@ -518,6 +521,8 @@ All commands live under the **Claude Keep/Undo** category.
 | Keep / Undo Claude's Change on This Line | Line-number context menu | |
 | Keep / Undo All Changes in This File | Editor title bar, Source Control, changes view, Quick Fix menu, palette | |
 | Keep / Undo All of Claude's Changes | Changes view toolbar, Source Control title bar, palette | |
+| Keep / Undo All Changes in This Folder | Multi-root changes view folder rows | |
+| Review This Folder's Claude Changes | Multi-root changes view folder rows | |
 | Restore the Last Undo | Undo notification, changes view menu, palette | |
 | Settings and Setup | Changes view title bar, palette | |
 | Open the Getting Started Walkthrough | Palette | |
@@ -607,8 +612,6 @@ Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-ap
   (VS Code refuses to write one that has syntax errors), you are told which key is
   affected. Still: if you disable or uninstall the extension while a diff is open,
   check those two settings.
-- **Single-root only.** The first workspace folder is handled — the usual
-  Claude Code layout.
 - **`claudeKeepUndo.trackOutsideWorkspace` only reaches the transcript channel.**
   The hook command records the workspace root when it is installed, so files
   outside the open folder are filtered out there regardless of the setting. Turning
@@ -706,7 +709,8 @@ npm run package     # npx @vscode/vsce package
 The extension does not make network requests, collect telemetry, or send
 anything anywhere. It reads your workspace files and your local Claude Code
 session transcripts, and writes baselines and recovery snapshots into VS
-Code's per-workspace storage — outside your repository, never inside it.
+Code's global storage (`globalStorage/folders/<hash>`), keyed by folder path
+— outside your repository, never inside it.
 All of it stays on your machine.
 
 A file matched by [an ignore rule](#ignoring-files) is not read at all: the rule

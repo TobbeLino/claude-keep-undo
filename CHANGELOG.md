@@ -5,6 +5,27 @@ All notable changes to **Keep / Undo for Claude Code** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0]
+
+### Added — multi-root workspaces
+
+- **Each workspace folder has its own review queue.** Hooks, ignore rules, the
+  transcript watcher and the Source Control entry are per folder, so two repos
+  in one window no longer share a single queue.
+- **Persistent state is keyed by folder path**, under
+  `globalStorage/folders/<hash>` — not by the VS Code workspace. Opening the
+  same repo on its own, or in another window, finds the same pending reviews.
+  Existing per-workspace storage is migrated once when the new location is
+  empty.
+- **Sibling folders are never treated as “outside the workspace.”**
+  `trackOutsideWorkspace` still covers files that belong to *no* folder; a file
+  in the other repo in this window belongs to that repo.
+- **Nested workspace folders:** the deepest root owns the file, so a repo
+  opened inside another is not double-tracked.
+- **The changes view groups by folder** when more than one root is open.
+  Keep All / Undo All / Review on a folder row (or on that folder’s Source
+  Control entry) apply only there.
+
 ## [1.2.0]
 
 ### Added — files Claude changes by running a shell command

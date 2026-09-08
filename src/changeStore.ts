@@ -26,6 +26,7 @@ import {
   looksBinary,
   moveDir,
   normalizePath,
+  pathIsInFolderScope,
   pathKey,
   bashDir,
   pendingDir,
@@ -192,12 +193,72 @@ const ORPHAN_GRACE_MS = 5_000;
 const USER_TOUCHED_MAX = 2048;
 
 /**
+ * The review-store surface the UI, commands and transcript watcher talk to.
+ *
+ * {@link ChangeStore} is one folder. The hub is the same questions asked of
+ * every folder in the window, routing each path to the store that owns it. An
+ * interface rather than the class keeps the UI off the private members that
+ * would make the hub unassignable.
+ */
+export interface ReviewStore {
+  readonly onDidChange: vscode.Event<vscode.Uri | undefined>;
+  readonly onDidDetect: vscode.Event<vscode.Uri>;
+  getTracked(): TrackedFile[];
+  isTracked(absPath: string): boolean;
+  hasBaseline(absPath: string): boolean;
+  get(absPath: string): TrackedFile | undefined;
+  count(): number;
+  isApplyingEdit(): boolean;
+  isUserTouched(absPath: string): boolean;
+  isCreated(absPath: string): boolean;
+  isInScope(absPath: string): boolean;
+  isIgnored(absPath: string): boolean;
+  getUnreviewable(): Unreviewable[];
+  noteUnreviewable(absPath: string, reason: string): void;
+  clearUnreviewable(absPath?: string): void;
+  noteUserEdit(absPath: string): void;
+  getBaseline(absPath: string): string;
+  hunkIndexAtLine(absPath: string, line: number): number | undefined;
+  registerBaseline(
+    absPath: string,
+    baseline: string,
+    options?: { created?: boolean }
+  ): void;
+  refreshFromDisk(): void;
+  reloadBaseline(absPath: string): void;
+  recompute(absPath: string, silent?: boolean, noResolve?: boolean): void;
+  keepHunk(absPath: string, index: number, fingerprint?: string): ApplyResult;
+  undoHunk(
+    absPath: string,
+    index: number,
+    fingerprint?: string
+  ): Promise<ApplyResult>;
+  keepLineChange(absPath: string, change: LineChange): ApplyResult;
+  undoLineChange(absPath: string, change: LineChange): Promise<ApplyResult>;
+  keepFile(absPath: string): void;
+  undoFile(absPath: string): Promise<ApplyResult>;
+  keepAll(): void;
+  undoAll(): Promise<UndoBatchResult>;
+  undoPaths(paths: string[]): Promise<UndoBatchResult>;
+  captureUndoSnapshot(absPath: string): UndoSnapshot | undefined;
+  stampPostUndo(snapshots: UndoSnapshot[]): UndoSnapshot[];
+  restoreUndoSnapshots(
+    snapshots: UndoSnapshot[]
+  ): Promise<{ failed: string[]; stale: string[] }>;
+  snapshotsLocation(): string;
+  wouldDelete(absPath: string): boolean;
+  reconcileIgnored(): string[];
+}
+
+/**
  * Single source of truth for "what has Claude changed and not yet reviewed".
  *
- * State is backed by files under VS Code's per-workspace storage directory —
- * deliberately *outside* the repository, because baselines and snapshots are
- * verbatim copies of the user's source and one `git add -A` away from committing
- * whatever secrets those files held:
+ * State is backed by files under VS Code's global storage, one directory per
+ * workspace folder — deliberately *outside* the repository, because baselines
+ * and snapshots are verbatim copies of the user's source and one `git add -A`
+ * away from committing whatever secrets those files held. Keyed by folder path
+ * (not by the VS Code workspace) so the same repo keeps its review queue when
+ * opened alone or in another window:
  *   - baselines/<key>        raw original content (before Claude's edits)
  *   - baselines/<key>.json   { path, ts } — makes the baseline self-describing
  *
@@ -209,7 +270,7 @@ const USER_TOUCHED_MAX = 2048;
  * content. Keep folds the change into the baseline; Undo reverts the file.
  * Either way, once baseline === current the entry resolves and disappears.
  */
-export class ChangeStore implements vscode.Disposable {
+export class ChangeStore implements vscode.Disposable, ReviewStore {
   private tracked = new Map<string, TrackedFile>();
   private userTouched = new Set<string>();
   private unreviewable = new Map<string, string>();
@@ -219,6 +280,8 @@ export class ChangeStore implements vscode.Disposable {
   private lastStateWrite = 0;
   private disposed = false;
   private trackOutsideWorkspace = false;
+  /** Other folders in this window; files under them are not ours. */
+  private peerRoots: string[] = [];
   private readonly normalizedRoot: string;
   private housekeeping: NodeJS.Timeout | undefined;
   private readonly disposables: vscode.Disposable[] = [];
@@ -294,24 +357,31 @@ export class ChangeStore implements vscode.Disposable {
   }
 
   /**
+   * Other workspace folders in this window. Files under those roots belong to
+   * *their* store, including when this folder is nested around one of them.
+   */
+  setPeerRoots(roots: readonly string[]): void {
+    this.peerRoots = roots.filter(
+      (root) => normalizePath(root) !== this.normalizedRoot
+    );
+  }
+
+  /**
    * Is this path one we should be reviewing at all?
    *
    * Claude edits files outside the open folder routinely — its own settings, a
    * scratch file, a sibling repository it was asked to read. Tracking those puts
-   * verbatim copies of them into *this* workspace's state directory and lists
-   * them in a view whose paths are relative to a root they are not under.
+   * verbatim copies of them into *this* folder's state directory and lists them
+   * in a view whose paths are relative to a root they are not under. A sibling
+   * workspace folder is not "outside": it has its own store.
    */
   isInScope(absPath: string): boolean {
-    if (this.trackOutsideWorkspace) {
-      return true;
-    }
-    const rel = path.relative(this.normalizedRoot, normalizePath(absPath));
-    if (rel === "" || path.isAbsolute(rel)) {
-      return false;
-    }
-    // `startsWith("..")` also matches a directory genuinely named `..cache`,
-    // which would then be silently excluded from review.
-    return rel !== ".." && !rel.startsWith(`..${path.sep}`);
+    return pathIsInFolderScope(
+      absPath,
+      this.workspaceRoot,
+      this.peerRoots,
+      this.trackOutsideWorkspace
+    );
   }
 
   /**

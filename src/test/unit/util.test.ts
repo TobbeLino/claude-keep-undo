@@ -7,9 +7,12 @@ import {
   atomicCopy,
   atomicWrite,
   encodeProjectDir,
+  isInsideRoot,
   isUtf8Text,
   listDir,
   looksBinary,
+  owningRoot,
+  pathIsInFolderScope,
   pathKey,
   readFileBytesResult,
   readFileResult,
@@ -278,6 +281,71 @@ describe("path helpers", () => {
       encodeProjectDir("/Users/x/Documents/claude_keepundo"),
       "-Users-x-Documents-claude-keepundo"
     );
+  });
+});
+
+describe("isInsideRoot", () => {
+  const root = path.join(tmp, "proj");
+
+  it("accepts a file or subdirectory of the root", () => {
+    assert.equal(isInsideRoot(root, path.join(root, "src", "a.ts")), true);
+    assert.equal(isInsideRoot(root, path.join(root, "src")), true);
+  });
+
+  it("rejects the root itself", () => {
+    assert.equal(isInsideRoot(root, root), false);
+  });
+
+  it("rejects a sibling that only shares a prefix", () => {
+    assert.equal(
+      isInsideRoot(root, path.join(tmp, "proj-other", "a.ts")),
+      false
+    );
+    assert.equal(
+      isInsideRoot(path.join(tmp, "app"), path.join(tmp, "apple", "x.ts")),
+      false
+    );
+  });
+});
+
+describe("owningRoot", () => {
+  it("picks the deepest nested root", () => {
+    const outer = path.join(tmp, "outer");
+    const inner = path.join(outer, "inner");
+    const nested = path.join(inner, "a.ts");
+    assert.equal(owningRoot([outer, inner], nested), inner);
+    assert.equal(owningRoot([outer], nested), outer);
+  });
+
+  it("returns undefined when no root contains the file", () => {
+    const a = path.join(tmp, "a");
+    const b = path.join(tmp, "b", "file.ts");
+    assert.equal(owningRoot([a], b), undefined);
+  });
+});
+
+describe("pathIsInFolderScope", () => {
+  it("does not treat a sibling workspace folder as outside-the-workspace", () => {
+    const a = path.join(tmp, "repo-a");
+    const b = path.join(tmp, "repo-b");
+    const fileB = path.join(b, "src", "x.ts");
+    assert.equal(pathIsInFolderScope(fileB, a, [b], true), false);
+    assert.equal(pathIsInFolderScope(fileB, b, [a], false), true);
+  });
+
+  it("gives nested files to the inner root", () => {
+    const outer = path.join(tmp, "mono");
+    const inner = path.join(outer, "pkg");
+    const file = path.join(inner, "index.ts");
+    assert.equal(pathIsInFolderScope(file, inner, [outer], false), true);
+    assert.equal(pathIsInFolderScope(file, outer, [inner], false), false);
+  });
+
+  it("honours trackOutside for paths under no folder", () => {
+    const a = path.join(tmp, "only");
+    const outside = path.join(tmp, "elsewhere", "scratch.ts");
+    assert.equal(pathIsInFolderScope(outside, a, [], true), true);
+    assert.equal(pathIsInFolderScope(outside, a, [], false), false);
   });
 });
 

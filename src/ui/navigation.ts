@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { Hunk, hunkLineRange } from "../diff";
 import { BASELINE_SCHEME } from "../util";
 import { summarizeHunk } from "./format";
@@ -14,7 +14,7 @@ import { summarizeHunk } from "./format";
  * next → read → decide → next.
  */
 export async function goToChange(
-  store: ChangeStore,
+  store: ReviewStore,
   direction: 1 | -1
 ): Promise<void> {
   const editor = vscode.window.activeTextEditor;
@@ -79,7 +79,7 @@ function pick(hunks: Hunk[], line: number, direction: 1 | -1): number {
 
 /** Nothing here — but say where there *is* something, rather than just "no". */
 async function offerAnotherFile(
-  store: ChangeStore,
+  store: ReviewStore,
   absPath: string
 ): Promise<void> {
   const others = store.getTracked().filter((f) => f.path !== absPath);

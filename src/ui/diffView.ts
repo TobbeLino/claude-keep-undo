@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { BASELINE_SCHEME } from "../util";
 
 export { BASELINE_SCHEME } from "../util";
@@ -32,7 +32,7 @@ export class BaselineContentProvider
   readonly onDidChange = this._onDidChange.event;
   private readonly listener: vscode.Disposable;
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.listener = store.onDidChange((uri) => {
       if (uri) {
         this._onDidChange.fire(toBaselineUri(uri.fsPath));

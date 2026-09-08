@@ -30,6 +30,101 @@ export function pathKey(absPath: string): string {
 }
 
 /**
+ * Is `absPath` a file or subdirectory of `root` — not the root itself, and not
+ * something that merely shares a prefix (`/app` vs `/apple`)?
+ *
+ * Same rule `ChangeStore.isInScope` has always used; extracted so multi-root
+ * routing and the store can share one answer.
+ */
+export function isInsideRoot(root: string, absPath: string): boolean {
+  const rel = path.relative(normalizePath(root), normalizePath(absPath));
+  if (rel === "" || path.isAbsolute(rel)) {
+    return false;
+  }
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`);
+}
+
+/**
+ * The workspace folder that owns this file: the deepest root that contains it.
+ *
+ * Nested folders (a repo opened inside another) must not double-track: the
+ * inner root wins. A path under no root yields `undefined`.
+ */
+export function owningRoot(
+  roots: readonly string[],
+  absPath: string
+): string | undefined {
+  let best: string | undefined;
+  let bestLen = -1;
+  for (const root of roots) {
+    if (!isInsideRoot(root, absPath)) {
+      continue;
+    }
+    const n = normalizePath(root).length;
+    if (n > bestLen) {
+      best = root;
+      bestLen = n;
+    }
+  }
+  return best;
+}
+
+/**
+ * Should this folder's store review `absPath`?
+ *
+ * A file under a *peer* workspace folder belongs to that folder, even when
+ * `trackOutside` is on — "outside the workspace" is not "the other repo in this
+ * window". Nested peers take the inner root. Files under no folder follow
+ * `trackOutside`.
+ */
+export function pathIsInFolderScope(
+  absPath: string,
+  folderRoot: string,
+  peerRoots: readonly string[],
+  trackOutside: boolean
+): boolean {
+  const owner = owningRoot([folderRoot, ...peerRoots], absPath);
+  if (owner !== undefined) {
+    return normalizePath(owner) === normalizePath(folderRoot);
+  }
+  return trackOutside;
+}
+
+/** Per-folder review state, keyed by the folder path so it follows the repo. */
+export function folderStateDir(
+  globalStorageFsPath: string,
+  folderRoot: string
+): string {
+  return path.join(globalStorageFsPath, "folders", pathKey(folderRoot));
+}
+
+/**
+ * Where 1.2.x fell back when `storageUri` was missing: still keyed by folder,
+ * but under `workspaces/` rather than `folders/`.
+ */
+export function legacyWorkspaceFallbackStateDir(
+  globalStorageFsPath: string,
+  folderRoot: string
+): string {
+  return path.join(globalStorageFsPath, "workspaces", pathKey(folderRoot));
+}
+
+/** True when a state directory already holds baselines or staged copies. */
+export function stateDirHasContent(dir: string): boolean {
+  if (!fileExists(dir)) {
+    return false;
+  }
+  return (
+    listDir(baselinesDir(dir)).some(
+      (name) => !name.endsWith(".json") && !name.endsWith(".tmp")
+    ) ||
+    listDir(pendingDir(dir)).some(
+      (name) => !name.endsWith(".json") && !name.endsWith(".tmp")
+    )
+  );
+}
+
+/**
  * Encode a working directory the way Claude Code names its project folder under
  * ~/.claude/projects (every non-alphanumeric character becomes a dash).
  * Example: /Users/x/Documents/claude_keepundo -> -Users-x-Documents-claude-keepundo
@@ -75,7 +170,8 @@ export function claudeFileHistoryDir(): string {
 
 // --- shared on-disk layout ------------------------------------------------
 //
-// <stateDir>/                       (VS Code's per-workspace storage, NOT the repo)
+// <stateDir>/                       (per *folder*, under VS Code globalStorage,
+//                                   NOT the repo and not the VS Code workspace)
 //   baselines/<key>                 original (pre-Claude) content
 //   baselines/<key>.json            { path, ts } sidecar — makes each baseline
 //                                   self-describing so no shared index file has
@@ -85,9 +181,11 @@ export function claudeFileHistoryDir(): string {
 //   snapshots/<key>-<ts>            pre-Undo safety copies
 //   events.ndjson                   append-only hook event log (size-capped)
 //
-// The state deliberately lives outside the workspace: baselines and snapshots
-// are verbatim copies of the user's source, and keeping them in the repository
-// is one `git add -A` away from committing whatever secrets those files held.
+// Keyed by the folder path so the same repo keeps its review queue when opened
+// alone, in another multi-root window, or after a reload. Deliberately outside
+// the repository: baselines and snapshots are verbatim copies of the user's
+// source, and keeping them there is one `git add -A` away from committing
+// whatever secrets those files held.
 
 export function baselinesDir(stateDir: string): string {
   return path.join(stateDir, "baselines");
