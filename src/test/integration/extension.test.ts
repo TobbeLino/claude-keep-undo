@@ -471,6 +471,33 @@ describe("Keep / Undo for Claude Code", () => {
     }
   });
 
+  it("does not delete an out-of-workspace baseline on refresh", async () => {
+    // Folder-keyed state is shared across windows. A window that does not own
+    // this path (different folders, or trackOutsideWorkspace off) must hide it,
+    // not wipe the only pre-Claude copy.
+    const outside = path.join(
+      os.tmpdir(),
+      `keepundo-foreign-${Date.now()}.txt`
+    );
+    fs.writeFileSync(outside, "now\n");
+    const content = seedBaseline(outside, "before\n");
+    try {
+      await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+      await wait(200);
+      assert.equal(api.store.isTracked(outside), false);
+      assert.equal(
+        fileExists(content),
+        true,
+        "another window may still own this review"
+      );
+      assert.equal(fileExists(sidecarPath(content)), true);
+    } finally {
+      fs.rmSync(outside, { force: true });
+      fs.rmSync(content, { force: true });
+      fs.rmSync(sidecarPath(content), { force: true });
+    }
+  });
+
   it("reports rather than reveals an empty snapshots directory", async () => {
     // Revealing a directory that does not exist does nothing at all on macOS,
     // which reads as a broken safety net.

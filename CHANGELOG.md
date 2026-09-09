@@ -17,14 +17,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   same repo on its own, or in another window, finds the same pending reviews.
   Existing per-workspace storage is migrated once when the new location is
   empty.
-- **Sibling folders are never treated as “outside the workspace.”**
-  `trackOutsideWorkspace` still covers files that belong to *no* folder; a file
-  in the other repo in this window belongs to that repo.
+- **Sibling folders are never treated as “outside the workspace.”** A file in
+  the other repo in this window belongs to that repo.
+
+### Changed
+
+- **`trackOutsideWorkspace` is mostly obsolete.** Multi-root support replaces
+  the setting for sibling (and nested) repositories: add the folder to the
+  window instead. The setting is kept for the leftover case — transcript
+  detection of Edit/Write on a file that sits under *no* workspace folder
+  (Claude's own settings, a scratch file). The hooks still never copy those.
 - **Nested workspace folders:** the deepest root owns the file, so a repo
-  opened inside another is not double-tracked.
+  opened inside another is not double-tracked. Existing reviews move with
+  ownership rather than being dropped or duplicated.
 - **The changes view groups by folder** when more than one root is open.
   Keep All / Undo All / Review on a folder row (or on that folder’s Source
   Control entry) apply only there.
+- **A Claude session started in one folder captures the others too.** The hook
+  photographs every workspace repo on a shell command, and routes Edit/Write
+  files into the owning folder's queue — so a `printf > sibling/file` shows up
+  under that sibling, not only the session's own repo.
+- **Pending reviews survive a window that does not own them.** Opening the same
+  folder with different siblings, or with `trackOutsideWorkspace` off, no longer
+  deletes baselines that are out of this window's scope — they stay on disk and
+  reappear when a window that owns them loads. Adding or removing a nested
+  folder *moves* the recorded original into the folder that owns the file, so
+  the review is kept once and is not duplicated.
+- **Undo finds a file Git and VS Code spell differently.** On Windows a
+  shell-created file was listed in the queue (git's `D:\...`) while Undo from
+  the editor looked up `d:\...`, reported nothing to undo, and left the file on
+  disk. In-memory review state now folds path case the same way the on-disk
+  keys already did.
 
 ## [1.2.0]
 

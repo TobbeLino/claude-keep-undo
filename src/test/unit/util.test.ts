@@ -11,12 +11,20 @@ import {
   isUtf8Text,
   listDir,
   looksBinary,
+  owningPeer,
   owningRoot,
+  parseHookPeers,
+  PathMap,
+  PathSet,
   pathIsInFolderScope,
   pathKey,
+  normalizePath,
   readFileBytesResult,
   readFileResult,
   readSidecar,
+  rehomeDisplacedPairs,
+  relocateStatePair,
+  serializeHookPeers,
   sidecarPath,
   uniqueSuffix,
 } from "../../util";
@@ -284,6 +292,28 @@ describe("path helpers", () => {
   });
 });
 
+describe("PathMap / PathSet", () => {
+  it("treats two spellings of the same file as one entry", () => {
+    const file = path.join(tmp, "SHELL_TEST_V2.txt");
+    const alt = flipPathCase(file);
+    if (alt === file || normalizePath(file) !== normalizePath(alt)) {
+      return; // Linux does not fold, so these would be two files
+    }
+    const map = new PathMap<string>();
+    map.set(file, "from-hook");
+    assert.equal(map.get(alt), "from-hook");
+    assert.equal(map.has(alt), true);
+    map.delete(alt);
+    assert.equal(map.has(file), false);
+
+    const set = new PathSet();
+    set.add(file);
+    assert.equal(set.has(alt), true);
+    set.delete(alt);
+    assert.equal(set.has(file), false);
+  });
+});
+
 describe("isInsideRoot", () => {
   const root = path.join(tmp, "proj");
 
@@ -349,8 +379,147 @@ describe("pathIsInFolderScope", () => {
   });
 });
 
+describe("hook peers", () => {
+  it("falls back to the session folder when the file is missing", () => {
+    const self = { root: "/ws/a", stateDir: "/state/a" };
+    assert.deepEqual(parseHookPeers(undefined, self), [self]);
+    assert.deepEqual(parseHookPeers("{", self), [self]);
+  });
+
+  it("reads every well-formed folder and skips junk", () => {
+    const a = { root: "/ws/a", stateDir: "/state/a" };
+    const b = { root: "/ws/b", stateDir: "/state/b" };
+    const raw = serializeHookPeers([a, b]);
+    assert.deepEqual(parseHookPeers(raw, a), [a, b]);
+    const mixed = JSON.stringify({
+      v: 1,
+      folders: [a, { root: 1 }, b, null],
+    });
+    assert.deepEqual(parseHookPeers(mixed, a), [a, b]);
+  });
+
+  it("gives a sibling path to that sibling's folder", () => {
+    const a = { root: path.join(tmp, "repo-a"), stateDir: "/state/a" };
+    const b = { root: path.join(tmp, "repo-b"), stateDir: "/state/b" };
+    const fileB = path.join(b.root, "CROSS.txt");
+    assert.equal(owningPeer([a, b], fileB), b);
+    assert.equal(owningPeer([a, b], path.join(a.root, "x.ts")), a);
+    assert.equal(
+      owningPeer([a, b], path.join(tmp, "elsewhere", "x.ts")),
+      undefined
+    );
+  });
+});
+
+describe("relocateStatePair", () => {
+  it("moves content and sidecar into the destination directory", () => {
+    const srcDir = path.join(tmp, "relocate-src");
+    const destDir = path.join(tmp, "relocate-dest");
+    const content = path.join(srcDir, "abcd1234");
+    atomicWrite(content, "original\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: "/x.ts", ts: 1 }));
+    assert.equal(relocateStatePair(content, destDir), "moved");
+    const dest = path.join(destDir, "abcd1234");
+    assert.equal(fs.readFileSync(dest, "utf8"), "original\n");
+    assert.equal(readSidecar(dest)?.path, "/x.ts");
+    assert.equal(fs.existsSync(content), false);
+    assert.equal(fs.existsSync(sidecarPath(content)), false);
+  });
+
+  it("keeps the destination copy when the same key is already there", () => {
+    const srcDir = path.join(tmp, "relocate-dup-src");
+    const destDir = path.join(tmp, "relocate-dup-dest");
+    const content = path.join(srcDir, "dupkey");
+    const dest = path.join(destDir, "dupkey");
+    atomicWrite(content, "source\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: "/y.ts", ts: 1 }));
+    atomicWrite(dest, "destination\n");
+    atomicWrite(sidecarPath(dest), JSON.stringify({ path: "/y.ts", ts: 2 }));
+    assert.equal(relocateStatePair(content, destDir), "kept-destination");
+    assert.equal(fs.readFileSync(dest, "utf8"), "destination\n");
+    assert.equal(fs.existsSync(content), false);
+  });
+});
+
+describe("rehomeDisplacedPairs", () => {
+  it("moves a nested file into the inner folder and leaves a foreign one", () => {
+    const outer = path.join(tmp, "mono");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "index.ts");
+    const foreign = path.join(tmp, "elsewhere", "scratch.ts");
+    const outerState = path.join(tmp, "state-outer");
+    const innerState = path.join(tmp, "state-inner");
+    const nestedKey = pathKey(nested);
+    const foreignKey = pathKey(foreign);
+    const nestedContent = path.join(outerState, "baselines", nestedKey);
+    const foreignContent = path.join(outerState, "baselines", foreignKey);
+    atomicWrite(nestedContent, "nested-orig\n");
+    atomicWrite(
+      sidecarPath(nestedContent),
+      JSON.stringify({ path: nested, ts: 1 })
+    );
+    atomicWrite(foreignContent, "foreign-orig\n");
+    atomicWrite(
+      sidecarPath(foreignContent),
+      JSON.stringify({ path: foreign, ts: 1 })
+    );
+
+    const n = rehomeDisplacedPairs(
+      outerState,
+      outer,
+      [{ root: inner, stateDir: innerState }],
+      "baselines"
+    );
+    assert.equal(n, 1);
+    const dest = path.join(innerState, "baselines", nestedKey);
+    assert.equal(fs.readFileSync(dest, "utf8"), "nested-orig\n");
+    assert.equal(fs.existsSync(nestedContent), false);
+    assert.equal(
+      fs.readFileSync(foreignContent, "utf8"),
+      "foreign-orig\n",
+      "a path no peer owns must stay put"
+    );
+  });
+
+  it("moves a nested file back to the outer folder when the inner leaves", () => {
+    const outer = path.join(tmp, "mono-back");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "lib.ts");
+    const innerState = path.join(tmp, "state-inner-back");
+    const outerState = path.join(tmp, "state-outer-back");
+    const key = pathKey(nested);
+    const content = path.join(innerState, "baselines", key);
+    atomicWrite(content, "from-inner\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: nested, ts: 1 }));
+
+    const n = rehomeDisplacedPairs(
+      innerState,
+      inner,
+      [{ root: outer, stateDir: outerState }],
+      "baselines"
+    );
+    assert.equal(n, 1);
+    assert.equal(
+      fs.readFileSync(path.join(outerState, "baselines", key), "utf8"),
+      "from-inner\n"
+    );
+    assert.equal(fs.existsSync(content), false);
+  });
+});
+
 describe("listDir", () => {
   it("returns an empty array for a missing directory", () => {
     assert.deepEqual(listDir(path.join(tmp, "does-not-exist")), []);
   });
 });
+
+/** Flip the first letter that has case, so `D:\...` and `d:\...` can be compared. */
+function flipPathCase(filePath: string): string {
+  const i = [...filePath].findIndex((c) => c.toLowerCase() !== c.toUpperCase());
+  if (i < 0) {
+    return filePath;
+  }
+  const c = filePath[i];
+  const flipped = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase();
+  return filePath.slice(0, i) + flipped + filePath.slice(i + 1);
+}

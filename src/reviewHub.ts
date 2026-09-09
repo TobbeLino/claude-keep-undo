@@ -1,3 +1,4 @@
+import * as path from "path";
 import * as vscode from "vscode";
 import {
   ApplyResult,
@@ -22,12 +23,16 @@ import { IgnoreConfig } from "./ignoreConfig";
 import * as settings from "./settings";
 import { ClaudeSourceControl, DoubledGutterNotice } from "./ui/quickDiff";
 import {
+  atomicWrite,
   ensureDir,
   folderStateDir,
+  HookPeerFolder,
+  HOOK_PEERS_FILE,
   legacyWorkspaceFallbackStateDir,
   moveDir,
   normalizePath,
   owningRoot,
+  serializeHookPeers,
   stateDirHasContent,
 } from "./util";
 
@@ -357,6 +362,10 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
   }
 
   refreshFromDisk(): void {
+    // Move first, then load: a nested folder added in this window would
+    // otherwise refresh the destination before the source has handed the file
+    // over.
+    this.rehomeAcrossFolders();
     for (const session of this.getFolders()) {
       session.store.refreshFromDisk();
     }
@@ -640,6 +649,46 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     return folderStateDir(this.context.globalStorageUri.fsPath, "_none");
   }
 
+  /**
+   * Tell every folder's hook which other folders are in this window. Claude only
+   * loads hooks from the project it was started in, so a Bash call in repo A
+   * would otherwise never photograph sibling repo B.
+   */
+  private publishHookPeers(): void {
+    const folders = this.getFolders().map((s) => ({
+      root: s.root,
+      stateDir: s.stateDir,
+    }));
+    const text = serializeHookPeers(folders);
+    for (const session of this.getFolders()) {
+      atomicWrite(path.join(session.stateDir, HOOK_PEERS_FILE), text);
+    }
+  }
+
+  private applyPeerFolders(): void {
+    const folders = this.peerFolderList();
+    for (const session of this.getFolders()) {
+      session.store.setPeerFolders(folders);
+    }
+  }
+
+  private peerFolderList(): HookPeerFolder[] {
+    return this.getFolders().map((s) => ({
+      root: s.root,
+      stateDir: s.stateDir,
+    }));
+  }
+
+  private rehomeAcrossFolders(): boolean {
+    let any = false;
+    for (const session of this.getFolders()) {
+      if (session.store.rehomeDisplaced()) {
+        any = true;
+      }
+    }
+    return any;
+  }
+
   private syncFolders(): void {
     if (this.disposed) {
       return;
@@ -664,18 +713,27 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
       session.attachToHub(this);
       changed = true;
     }
+    const remaining: HookPeerFolder[] = [];
+    for (const [key, session] of this.sessions) {
+      if (seen.has(key)) {
+        remaining.push({ root: session.root, stateDir: session.stateDir });
+      }
+    }
     for (const [key, session] of [...this.sessions]) {
       if (!seen.has(key)) {
+        // Nested folder leaving: hand its queue to whichever remaining root
+        // still contains the file. A sibling leaving keeps its own state dir.
+        session.store.setPeerFolders(remaining);
+        session.store.rehomeDisplaced();
         session.dispose();
         this.sessions.delete(key);
         changed = true;
       }
     }
-    const roots = this.getFolders().map((s) => s.root);
-    for (const session of this.getFolders()) {
-      session.store.setPeerRoots(roots);
-    }
-    if (changed) {
+    this.applyPeerFolders();
+    this.publishHookPeers();
+    const rehomed = this.rehomeAcrossFolders();
+    if (changed || rehomed) {
       for (const session of this.getFolders()) {
         session.store.refreshFromDisk();
         session.syncDetectors();

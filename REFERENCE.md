@@ -182,6 +182,12 @@ detection is switched off.
 - **`PostToolUse`** runs *after* the write lands. It promotes the staged copy to
   a real baseline, so the extension always computes a genuine diff.
 
+Claude Code only loads hooks from the project the session was started in. In a
+multi-root window the extension publishes `peers.json` into every folder's
+state directory, and the hook photographs **each** of those repos on a `Bash`
+call, writing into that folder's own queue. Edit/Write of a file in a sibling
+folder is captured there too, rather than dropped for being outside `--root`.
+
 The hook script never blocks a tool call: it swallows every error and always
 exits `0`.
 
@@ -346,12 +352,24 @@ another workspace:
 ├── bash/repo.json         the cached Git toplevel, so it is not re-derived per call
 ├── unreviewable/<key>.json a file the hook could not recover, and why; drained and deleted
 ├── ignore.json            the ignore rules, published for the hook process
+├── peers.json             every folder in this window, so one repo's hook can capture the others
 └── events.ndjson          size-capped log of hook events
 ```
 
 `<key>` is a truncated SHA-1 of the absolute file path. Every entry carries its
 own sidecar rather than sharing an index file, because the hook process and the
 extension both write here and a shared file would lose updates.
+
+A baseline that this window does not own is **left on disk**, not deleted: another
+window may still be reviewing that file (different folders, or
+`trackOutsideWorkspace` off here and on there). Adding a nested workspace folder
+moves the recorded original from the outer folder's state into the inner one;
+removing the nested folder moves it back. Two folders never keep a copy of the
+same path. An ignore rule that applies to a file this folder *does* own still
+deletes that copy — that is "stop reviewing this file." Workspace-scoped
+`ignore.patterns` in another `.code-workspace` that also opens this folder can
+therefore still drop reviews; a `.keepundoignore` in the repo cannot surprise
+you that way, because every window reads the same file.
 
 `baselines/` and `snapshots/` hold verbatim copies of your source files —
 including whatever secrets those files contain. Keeping them outside the
@@ -612,15 +630,16 @@ Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-ap
   (VS Code refuses to write one that has syntax errors), you are told which key is
   affected. Still: if you disable or uninstall the extension while a diff is open,
   check those two settings.
-- **`claudeKeepUndo.trackOutsideWorkspace` only reaches the transcript channel.**
-  The hook command records the workspace root when it is installed, so files
-  outside the open folder are filtered out there regardless of the setting. Turning
-  it on and reinstalling the hooks is the workaround.
-- **Case-insensitive paths are matched by spelling in memory.** On Windows and
-  macOS the on-disk state folds case, but the in-memory review state does not, so a
-  path VS Code and Claude Code spell with different casing can be tracked without
-  the editor surfaces recognising it. Not reproducible on a normal macOS setup;
-  Windows drive-letter casing is the case to watch.
+- **`claudeKeepUndo.trackOutsideWorkspace` only reaches files under no workspace
+  folder.** Sibling folders in the same window are captured by the hook via
+  `peers.json`. Files outside every open folder are still filtered out of the
+  hook (so a `.env` in a directory that is not in the workspace is never
+  copied); the transcript channel honours the setting for those.
+- **Path case is folded in memory the same way it is on disk.** On Windows the
+  hook (git's `D:\...`) and the editor (`uri.fsPath`, often `d:\...`) routinely
+  disagree on drive-letter casing. Keep/Undo look up the file by the folded
+  path, so a shell-created file in the queue can be undone from the editor that
+  opened it. Linux is still case-sensitive.
 
 ---
 
