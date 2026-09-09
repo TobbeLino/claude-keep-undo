@@ -29,14 +29,17 @@ import {
   hookPeersWindowFile,
   HookPeerFolder,
   HOOK_PEERS_FILE,
+  HOOK_PEERS_HEARTBEAT_MS,
   legacyWorkspaceFallbackStateDir,
   moveDir,
   normalizePath,
   owningRoot,
   readHookPeerRegistrations,
   removeFile,
+  serializeHookPeerRegistration,
   serializeHookPeers,
   stateDirHasContent,
+  writeFolderIdentity,
 } from "./util";
 
 /**
@@ -68,6 +71,7 @@ export class FolderSession implements vscode.Disposable {
   ) {
     this.stateDir = resolveFolderStateDir(context, folder, log);
     ensureDir(this.stateDir);
+    writeFolderIdentity(this.stateDir, this.root);
     this.log(`Active on ${this.root} (state: ${this.stateDir})`);
     this.ignore = new IgnoreConfig(this.root, this.stateDir, log);
     this.store = new ChangeStore(this.stateDir, this.root, log, this.ignore);
@@ -234,6 +238,8 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
   private readonly _onDidDropIgnored = new vscode.EventEmitter<string[]>();
   readonly onDidDropIgnored = this._onDidDropIgnored.event;
   private readonly folderListener: vscode.Disposable;
+  private readonly windowFocus: vscode.Disposable;
+  private heartbeat: NodeJS.Timeout | undefined;
   private confirmedIgnoreChange = false;
   private disposed = false;
 
@@ -244,6 +250,17 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     this.folderListener = vscode.workspace.onDidChangeWorkspaceFolders(() =>
       this.syncFolders()
     );
+    this.windowFocus = vscode.window.onDidChangeWindowState((state) => {
+      if (!this.disposed && state.focused) {
+        this.publishHookPeers();
+      }
+    });
+    this.heartbeat = setInterval(() => {
+      if (!this.disposed) {
+        this.publishHookPeers();
+      }
+    }, HOOK_PEERS_HEARTBEAT_MS);
+    this.heartbeat.unref?.();
     this.syncFolders();
   }
 
@@ -630,6 +647,11 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
   dispose(): void {
     this.disposed = true;
     this.folderListener.dispose();
+    this.windowFocus.dispose();
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = undefined;
+    }
     this.withdrawHookPeers();
     this.disposeSessions();
     this._onDidChange.dispose();
@@ -664,7 +686,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
    */
   private publishHookPeers(): void {
     const folders = this.peerFolderList();
-    const text = serializeHookPeers(folders);
+    const text = serializeHookPeerRegistration(folders);
     const windowId = vscode.env.sessionId;
     for (const session of this.getFolders()) {
       atomicWrite(hookPeersWindowFile(session.stateDir, windowId), text);

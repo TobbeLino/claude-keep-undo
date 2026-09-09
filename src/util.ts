@@ -188,6 +188,15 @@ export const HOOK_PEERS_FILE = "peers.json";
 /** Per-window peer registrations. Last-writer must not replace another window. */
 export const HOOK_PEERS_DIR = "peers.d";
 
+/** Rewrite this window's registration this often so a live window does not expire. */
+export const HOOK_PEERS_HEARTBEAT_MS = 5 * 60_000;
+
+/** Drop a window file that has not been rewritten within this interval. */
+export const HOOK_PEERS_TTL_MS = 30 * 60_000;
+
+/** Records which workspace folder a state directory belongs to. */
+export const FOLDER_IDENTITY_FILE = "folder.json";
+
 export interface HookPeerFolder {
   root: string;
   stateDir: string;
@@ -195,6 +204,13 @@ export interface HookPeerFolder {
 
 export function serializeHookPeers(folders: readonly HookPeerFolder[]): string {
   return JSON.stringify({ v: 1 as const, folders });
+}
+
+export function serializeHookPeerRegistration(
+  folders: readonly HookPeerFolder[],
+  ts = Date.now()
+): string {
+  return JSON.stringify({ v: 1 as const, ts, folders });
 }
 
 /**
@@ -261,32 +277,215 @@ export function hookPeersWindowFile(
 
 /**
  * Folders any currently registered window wants photographed. Per-window files
- * are the source of truth; `peers.json` is the combined list written for the
- * hook, and the fallback when no window file exists yet.
+ * are the source of truth. `peers.json` is the combined list written for the
+ * hook — used only when no `peers.d` directory exists yet (an older install).
+ * An empty `peers.d` means no window is registered, not "reuse the last union".
  */
 export function readHookPeerRegistrations(
   stateDir: string,
   fallback: HookPeerFolder
 ): HookPeerFolder[] {
-  const lists: HookPeerFolder[][] = [];
-  for (const name of listDir(path.join(stateDir, HOOK_PEERS_DIR))) {
-    if (!name.endsWith(".json") || name.endsWith(".tmp")) {
-      continue;
-    }
-    const raw = readFileSafe(path.join(stateDir, HOOK_PEERS_DIR, name));
-    const parsed = parseHookPeersList(raw);
-    if (parsed) {
-      lists.push(parsed);
-    }
-  }
+  const lists = listHookPeerRegistrationLists(stateDir);
   if (lists.length > 0) {
     return unionHookPeers(lists, fallback);
+  }
+  if (fileExists(path.join(stateDir, HOOK_PEERS_DIR))) {
+    return [fallback];
   }
   return (
     parseHookPeersList(readFileSafe(path.join(stateDir, HOOK_PEERS_FILE))) ?? [
       fallback,
     ]
   );
+}
+
+/**
+ * Live per-window folder lists. Expired files are deleted so they cannot keep
+ * a crashed window's capture scope alive.
+ */
+export function listHookPeerRegistrationLists(
+  stateDir: string
+): HookPeerFolder[][] {
+  const lists: HookPeerFolder[][] = [];
+  const dir = path.join(stateDir, HOOK_PEERS_DIR);
+  for (const name of listDir(dir)) {
+    if (!name.endsWith(".json") || name.endsWith(".tmp")) {
+      continue;
+    }
+    const filePath = path.join(dir, name);
+    const raw = readFileSafe(filePath);
+    if (!isFreshHookPeerRegistration(raw, filePath)) {
+      removeFile(filePath);
+      continue;
+    }
+    const parsed = parseHookPeersList(raw);
+    if (parsed) {
+      lists.push(parsed);
+    }
+  }
+  return lists;
+}
+
+export function isFreshHookPeerRegistration(
+  raw: string | undefined,
+  filePath: string,
+  now = Date.now()
+): boolean {
+  const ts = hookPeerRegistrationTime(raw, filePath);
+  if (ts === undefined) {
+    return false;
+  }
+  return now - ts <= HOOK_PEERS_TTL_MS;
+}
+
+function hookPeerRegistrationTime(
+  raw: string | undefined,
+  filePath: string
+): number | undefined {
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as { ts?: unknown };
+      if (typeof parsed.ts === "number" && Number.isFinite(parsed.ts)) {
+        return parsed.ts;
+      }
+    } catch {
+      /* fall through to mtime */
+    }
+  }
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when some registered window still has `selfRoot` open without `destRoot`
+ * (or, if `destRoot` is omitted, still has `selfRoot` at all). Opening a nested
+ * layout in this window must not move files another window still treats as
+ * belonging here.
+ */
+export function otherWindowHoldsFolder(
+  sourceStateDir: string,
+  selfRoot: string,
+  destRoot?: string
+): boolean {
+  const self = normalizePath(selfRoot);
+  const dest = destRoot === undefined ? undefined : normalizePath(destRoot);
+  for (const list of listHookPeerRegistrationLists(sourceStateDir)) {
+    const roots = new Set(list.map((folder) => normalizePath(folder.root)));
+    if (!roots.has(self)) {
+      continue;
+    }
+    if (dest === undefined || !roots.has(dest)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function writeFolderIdentity(stateDir: string, root: string): void {
+  atomicWrite(
+    path.join(stateDir, FOLDER_IDENTITY_FILE),
+    JSON.stringify({ v: 1 as const, root })
+  );
+}
+
+export function readFolderIdentity(stateDir: string): string | undefined {
+  const raw = readFileSafe(path.join(stateDir, FOLDER_IDENTITY_FILE));
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { v?: unknown; root?: unknown };
+    if (parsed.v === 1 && typeof parsed.root === "string" && parsed.root) {
+      return parsed.root;
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
+/**
+ * State directories of folders nested inside `selfRoot`. An outer-only window
+ * uses these to list reviews another window relocated into an inner store.
+ */
+export function descendantFolderStores(
+  selfStateDir: string,
+  selfRoot: string
+): HookPeerFolder[] {
+  return relatedFolderStores(selfStateDir, selfRoot).filter((folder) =>
+    isInsideRoot(selfRoot, folder.root)
+  );
+}
+
+/**
+ * Nested folders inside this one, and parent folders this one sits inside.
+ * Sibling repos share the `folders/` directory but are not related.
+ */
+export function relatedFolderStores(
+  selfStateDir: string,
+  selfRoot: string
+): HookPeerFolder[] {
+  const parent = path.dirname(selfStateDir);
+  const selfDir = normalizePath(selfStateDir);
+  const found: HookPeerFolder[] = [];
+  for (const name of listDir(parent)) {
+    const dir = path.join(parent, name);
+    if (normalizePath(dir) === selfDir) {
+      continue;
+    }
+    const root = readFolderIdentity(dir);
+    if (!root) {
+      continue;
+    }
+    if (isInsideRoot(selfRoot, root) || isInsideRoot(root, selfRoot)) {
+      found.push({ root, stateDir: dir });
+    }
+  }
+  return found;
+}
+
+/** Path of this folder's own baseline or staging for `absPath`, whether or not it exists yet. */
+export function ownStatePair(
+  absPath: string,
+  stateDir: string,
+  kind: "baselines" | "pending"
+): string {
+  const dirOf = kind === "baselines" ? baselinesDir : pendingDir;
+  return path.join(dirOf(stateDir), pathKey(absPath));
+}
+
+/**
+ * Path of the baseline or staging this window should *read* for `absPath`.
+ *
+ * This window's own store wins if it already has a copy — a browsing window
+ * must not take over (or delete) another window's original. If this store has
+ * none, fall back to a related store that does, so an outer-only window can
+ * still list reviews that already live in a nested store.
+ *
+ * Writes, Keep, and Undo must use {@link ownStatePair}: resolving a review
+ * that was only inherited would delete the other window's original.
+ */
+export function locateStatePair(
+  absPath: string,
+  stores: readonly HookPeerFolder[],
+  kind: "baselines" | "pending",
+  preferredStateDir: string
+): string {
+  const preferred = ownStatePair(absPath, preferredStateDir, kind);
+  if (fileExists(preferred)) {
+    return preferred;
+  }
+  const existing = stores.filter((folder) =>
+    fileExists(ownStatePair(absPath, folder.stateDir, kind))
+  );
+  if (existing.length === 0) {
+    return preferred;
+  }
+  const winner = owningPeer(existing, absPath) ?? existing[0];
+  return ownStatePair(absPath, winner.stateDir, kind);
 }
 
 /** The peer folder that owns this path, or undefined when none contains it. */
@@ -345,6 +544,9 @@ export function relocateStatePair(
   }
   ensureDir(destDir);
   const dest = path.join(destDir, path.basename(contentPath));
+  if (normalizePath(contentPath) === normalizePath(dest)) {
+    return "moved";
+  }
   const srcSidecar = sidecarPath(contentPath);
   const destSidecar = sidecarPath(dest);
   if (fileExists(dest)) {
@@ -369,13 +571,19 @@ export function relocateStatePair(
  * `owners` must include this folder when it is still in the window: otherwise a
  * nested inner store would treat the outer peer as the owner and bounce the
  * file back. When this folder is *leaving*, pass only the folders that remain.
+ *
+ * When *leaving*, a file is left in place if another window still has this
+ * folder open. When still open, a file is left in place if another window
+ * has this folder without the destination — merely opening a nested layout
+ * must not hide (or steal) another window's originals.
  */
 export function rehomeDisplacedPairs(
   sourceStateDir: string,
   selfRoot: string,
   owners: readonly HookPeerFolder[],
   kind: "baselines" | "pending",
-  log?: (msg: string) => void
+  log?: (msg: string) => void,
+  leaving = false
 ): number {
   if (owners.length === 0) {
     return 0;
@@ -397,6 +605,18 @@ export function rehomeDisplacedPairs(
     }
     const owner = owningPeer(owners, sidecar.path);
     if (!owner || normalizePath(owner.root) === self) {
+      continue;
+    }
+    if (
+      otherWindowHoldsFolder(
+        sourceStateDir,
+        selfRoot,
+        leaving ? undefined : owner.root
+      )
+    ) {
+      log?.(
+        `left ${kind} for ${sidecar.path} in place: another window still uses this folder`
+      );
       continue;
     }
     const destDir =
@@ -508,9 +728,10 @@ export function claudeFileHistoryDir(): string {
 //   pending/<key>.json              { path, ts } sidecar — `ts` expires stagings
 //   snapshots/<key>-<ts>            pre-Undo safety copies
 //   ignore.json                     ignore rules published for the hook process
+//   folder.json                     which workspace folder this state dir is for
 //   peers.d/<window>.json           this window's folders, so another window
 //                                   cannot overwrite the combined peer list
-//   peers.json                      union of every window's registration, for
+//   peers.json                      union of every live window's registration, for
 //                                   the hook running in one repo to capture
 //                                   the others
 //   events.ndjson                   append-only hook event log (size-capped)

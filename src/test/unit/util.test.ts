@@ -6,13 +6,18 @@ import { after, before, describe, it } from "node:test";
 import {
   atomicCopy,
   atomicWrite,
+  descendantFolderStores,
   encodeProjectDir,
+  HOOK_PEERS_TTL_MS,
   isInsideRoot,
   isUtf8Text,
   listDir,
+  locateStatePair,
+  ownStatePair,
   looksBinary,
   owningPeer,
   owningRoot,
+  otherWindowHoldsFolder,
   parseHookPeers,
   PathMap,
   PathSet,
@@ -23,12 +28,15 @@ import {
   readFileResult,
   readHookPeerRegistrations,
   readSidecar,
+  relatedFolderStores,
   rehomeDisplacedPairs,
   relocateStatePair,
+  serializeHookPeerRegistration,
   serializeHookPeers,
   sidecarPath,
   uniqueSuffix,
   unionHookPeers,
+  writeFolderIdentity,
 } from "../../util";
 
 let tmp: string;
@@ -429,6 +437,43 @@ describe("hook peers", () => {
     assert.deepEqual(roots, [a.root, b.root].sort());
   });
 
+  it("does not restore the last union after every window file is gone", () => {
+    const a = {
+      root: path.join(tmp, "empty-a"),
+      stateDir: path.join(tmp, "empty-state-a"),
+    };
+    const b = {
+      root: path.join(tmp, "empty-b"),
+      stateDir: path.join(tmp, "empty-state-b"),
+    };
+    const stateDir = path.join(tmp, "peer-empty");
+    atomicWrite(path.join(stateDir, "peers.json"), serializeHookPeers([a, b]));
+    fs.mkdirSync(path.join(stateDir, "peers.d"), { recursive: true });
+    assert.deepEqual(readHookPeerRegistrations(stateDir, a), [a]);
+  });
+
+  it("drops an expired window registration", () => {
+    const a = {
+      root: path.join(tmp, "exp-a"),
+      stateDir: path.join(tmp, "exp-state-a"),
+    };
+    const b = {
+      root: path.join(tmp, "exp-b"),
+      stateDir: path.join(tmp, "exp-state-b"),
+    };
+    const stateDir = path.join(tmp, "peer-expired");
+    const stale = path.join(stateDir, "peers.d", "stale.json");
+    atomicWrite(
+      stale,
+      serializeHookPeerRegistration(
+        [a, b],
+        Date.now() - HOOK_PEERS_TTL_MS - 1000
+      )
+    );
+    assert.deepEqual(readHookPeerRegistrations(stateDir, a), [a]);
+    assert.equal(fs.existsSync(stale), false);
+  });
+
   it("gives a sibling path to that sibling's folder", () => {
     const a = { root: path.join(tmp, "repo-a"), stateDir: "/state/a" };
     const b = { root: path.join(tmp, "repo-b"), stateDir: "/state/b" };
@@ -469,6 +514,15 @@ describe("relocateStatePair", () => {
     assert.equal(relocateStatePair(content, destDir), "kept-destination");
     assert.equal(fs.readFileSync(dest, "utf8"), "destination\n");
     assert.equal(fs.existsSync(content), false);
+  });
+
+  it("does not delete the file when it is already in the destination", () => {
+    const dir = path.join(tmp, "relocate-same");
+    const content = path.join(dir, "samekey");
+    atomicWrite(content, "only-copy\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: "/z.ts", ts: 1 }));
+    assert.equal(relocateStatePair(content, dir), "moved");
+    assert.equal(fs.readFileSync(content, "utf8"), "only-copy\n");
   });
 });
 
@@ -567,6 +621,161 @@ describe("rehomeDisplacedPairs", () => {
       false,
       "the outer store must not take a file the inner folder itself owns"
     );
+  });
+
+  it("leaves nested files in the outer store when another window lacks the inner folder", () => {
+    const outer = path.join(tmp, "mono-hold");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "held.ts");
+    const outerState = path.join(tmp, "state-outer-hold");
+    const innerState = path.join(tmp, "state-inner-hold");
+    const key = pathKey(nested);
+    const content = path.join(outerState, "baselines", key);
+    atomicWrite(content, "keep-outer\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: nested, ts: 1 }));
+    atomicWrite(
+      path.join(outerState, "peers.d", "outer-only.json"),
+      serializeHookPeerRegistration([{ root: outer, stateDir: outerState }])
+    );
+    atomicWrite(
+      path.join(outerState, "peers.d", "nested.json"),
+      serializeHookPeerRegistration([
+        { root: outer, stateDir: outerState },
+        { root: inner, stateDir: innerState },
+      ])
+    );
+
+    const n = rehomeDisplacedPairs(
+      outerState,
+      outer,
+      [
+        { root: outer, stateDir: outerState },
+        { root: inner, stateDir: innerState },
+      ],
+      "baselines"
+    );
+    assert.equal(n, 0);
+    assert.equal(fs.readFileSync(content, "utf8"), "keep-outer\n");
+    assert.equal(otherWindowHoldsFolder(outerState, outer, inner), true);
+  });
+});
+
+describe("locateStatePair", () => {
+  it("prefers this window's copy and does not delete the other store", () => {
+    const outer = path.join(tmp, "mono-dup");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "dup.ts");
+    const outerState = path.join(tmp, "state-outer-dup");
+    const innerState = path.join(tmp, "state-inner-dup");
+    const key = pathKey(nested);
+    const outerContent = path.join(outerState, "baselines", key);
+    const innerContent = path.join(innerState, "baselines", key);
+    atomicWrite(outerContent, "outer-original\n");
+    atomicWrite(
+      sidecarPath(outerContent),
+      JSON.stringify({ path: nested, ts: 1 })
+    );
+    atomicWrite(innerContent, "inner-copy\n");
+    atomicWrite(
+      sidecarPath(innerContent),
+      JSON.stringify({ path: nested, ts: 2 })
+    );
+    const stores = [
+      { root: outer, stateDir: outerState },
+      { root: inner, stateDir: innerState },
+    ];
+    assert.equal(
+      locateStatePair(nested, stores, "baselines", outerState),
+      outerContent
+    );
+    assert.equal(
+      locateStatePair(nested, stores, "baselines", innerState),
+      innerContent
+    );
+    assert.equal(fs.readFileSync(outerContent, "utf8"), "outer-original\n");
+    assert.equal(fs.readFileSync(innerContent, "utf8"), "inner-copy\n");
+  });
+
+  it("falls back to a related store when this window has no copy", () => {
+    const outer = path.join(tmp, "mono-fb");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "fb.ts");
+    const outerState = path.join(tmp, "state-outer-fb");
+    const innerState = path.join(tmp, "state-inner-fb");
+    const innerContent = path.join(innerState, "baselines", pathKey(nested));
+    atomicWrite(innerContent, "only-inner\n");
+    atomicWrite(
+      sidecarPath(innerContent),
+      JSON.stringify({ path: nested, ts: 1 })
+    );
+    const winner = locateStatePair(
+      nested,
+      [
+        { root: outer, stateDir: outerState },
+        { root: inner, stateDir: innerState },
+      ],
+      "baselines",
+      outerState
+    );
+    assert.equal(winner, innerContent);
+    assert.equal(fs.readFileSync(innerContent, "utf8"), "only-inner\n");
+  });
+
+  it("keeps new writes in this window's store", () => {
+    const outer = path.join(tmp, "mono-new");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "new.ts");
+    const outerState = path.join(tmp, "state-outer-new");
+    const innerState = path.join(tmp, "state-inner-new");
+    const winner = locateStatePair(
+      nested,
+      [
+        { root: outer, stateDir: outerState },
+        { root: inner, stateDir: innerState },
+      ],
+      "baselines",
+      outerState
+    );
+    assert.equal(winner, path.join(outerState, "baselines", pathKey(nested)));
+  });
+
+  it("does not write into a related store that already has a copy", () => {
+    const outer = path.join(tmp, "mono-own");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "own.ts");
+    const outerState = path.join(tmp, "state-outer-own");
+    const innerState = path.join(tmp, "state-inner-own");
+    const innerContent = path.join(innerState, "baselines", pathKey(nested));
+    atomicWrite(innerContent, "related-copy\n");
+    atomicWrite(
+      sidecarPath(innerContent),
+      JSON.stringify({ path: nested, ts: 1 })
+    );
+    assert.equal(
+      ownStatePair(nested, outerState, "baselines"),
+      path.join(outerState, "baselines", pathKey(nested))
+    );
+    assert.equal(fs.readFileSync(innerContent, "utf8"), "related-copy\n");
+  });
+});
+
+describe("descendantFolderStores", () => {
+  it("finds a nested folder's state directory next to this one", () => {
+    const outer = path.join(tmp, "disc-mono");
+    const inner = path.join(outer, "pkg");
+    const parent = path.join(tmp, "disc-folders");
+    const outerState = path.join(parent, "outer");
+    const innerState = path.join(parent, "inner");
+    writeFolderIdentity(innerState, inner);
+    writeFolderIdentity(outerState, outer);
+    const found = descendantFolderStores(outerState, outer);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].root, inner);
+    assert.equal(found[0].stateDir, innerState);
+    const parents = relatedFolderStores(innerState, inner);
+    assert.equal(parents.length, 1);
+    assert.equal(parents[0].root, outer);
+    assert.equal(parents[0].stateDir, outerState);
   });
 });
 

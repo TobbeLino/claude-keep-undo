@@ -100,6 +100,9 @@ function isInside(root, absPath) {
   return rel !== ".." && !rel.startsWith(`..${path.sep}`);
 }
 
+/** Must match `HOOK_PEERS_TTL_MS` in the extension's util.ts. */
+const HOOK_PEERS_TTL_MS = 30 * 60 * 1000;
+
 /**
  * Every workspace folder any open window wants photographed. Must match
  * `readHookPeerRegistrations` in the extension's util.ts.
@@ -111,12 +114,17 @@ function isInside(root, absPath) {
 function loadHookPeers(stateDir, selfRoot) {
   const fallback = selfRoot ? [{ root: selfRoot, stateDir }] : [];
   const lists = [];
+  const dir = path.join(stateDir, "peers.d");
+  let sawDir = false;
   try {
-    for (const name of fs.readdirSync(path.join(stateDir, "peers.d"))) {
+    const names = fs.readdirSync(dir);
+    sawDir = true;
+    for (const name of names) {
       if (!name.endsWith(".json") || name.endsWith(".tmp")) {
         continue;
       }
-      const folders = readPeersFile(path.join(stateDir, "peers.d", name));
+      const filePath = path.join(dir, name);
+      const folders = readPeersFile(filePath, true);
       if (folders.length > 0) {
         lists.push(folders);
       }
@@ -127,13 +135,25 @@ function loadHookPeers(stateDir, selfRoot) {
   if (lists.length > 0) {
     return unionPeerLists(lists, fallback);
   }
-  const combined = readPeersFile(path.join(stateDir, "peers.json"));
+  if (sawDir) {
+    return fallback;
+  }
+  const combined = readPeersFile(path.join(stateDir, "peers.json"), false);
   return combined.length > 0 ? combined : fallback;
 }
 
-function readPeersFile(filePath) {
+function readPeersFile(filePath, requireFresh) {
+  let raw;
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+  if (requireFresh && !isFreshPeerFile(filePath, raw)) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
     if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.folders)) {
       return [];
     }
@@ -151,6 +171,26 @@ function readPeersFile(filePath) {
   } catch {
     return [];
   }
+}
+
+function isFreshPeerFile(filePath, raw) {
+  let ts;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.ts === "number" && Number.isFinite(parsed.ts)) {
+      ts = parsed.ts;
+    }
+  } catch {
+    ts = undefined;
+  }
+  if (ts === undefined) {
+    try {
+      ts = fs.statSync(filePath).mtimeMs;
+    } catch {
+      return false;
+    }
+  }
+  return Date.now() - ts <= HOOK_PEERS_TTL_MS;
 }
 
 function unionPeerLists(lists, fallback) {

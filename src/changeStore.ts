@@ -19,6 +19,8 @@ import {
   BASELINE_SCHEME,
   baselinesDir,
   BytesReadResult,
+  locateStatePair,
+  ownStatePair,
   ensureDir,
   fileExists,
   HookPeerFolder,
@@ -28,6 +30,7 @@ import {
   moveDir,
   normalizePath,
   owningPeer,
+  otherWindowHoldsFolder,
   PathMap,
   PathSet,
   pathIsInFolderScope,
@@ -37,6 +40,7 @@ import {
   readFileBytesResult,
   readFileSafe,
   readSidecar,
+  descendantFolderStores,
   rehomeDisplacedPairs,
   relocateStatePair,
   removeFile,
@@ -397,7 +401,7 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
    * remain, so a nested store does transfer to the outer one.
    */
   rehomeToward(folders: readonly HookPeerFolder[]): boolean {
-    return this.relocateOwnedByOthers(folders);
+    return this.relocateOwnedByOthers(folders, true);
   }
 
   private ownershipCandidates(): HookPeerFolder[] {
@@ -407,21 +411,53 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
     ];
   }
 
-  private relocateOwnedByOthers(owners: readonly HookPeerFolder[]): boolean {
+  /**
+   * This folder plus nested folders whose state we surface.
+   *
+   * Parent stores are omitted on purpose: listing them would pull another
+   * window's originals into this queue, and Keep/Undo here would then look
+   * like they failed — or would delete those originals. Outer-only windows
+   * still see inner captures because those stores are descendants.
+   */
+  private relatedStores(): HookPeerFolder[] {
+    return [
+      { root: this.workspaceRoot, stateDir: this.stateDir },
+      ...descendantFolderStores(this.stateDir, this.workspaceRoot),
+    ];
+  }
+
+  /** True when `fsPath` lives in a related store this window is surfacing. */
+  coversInheritedState(fsPath: string): boolean {
+    const n = normalizePath(fsPath);
+    return this.relatedStores().some((folder) => {
+      if (normalizePath(folder.stateDir) === normalizePath(this.stateDir)) {
+        return false;
+      }
+      const root = normalizePath(folder.stateDir);
+      return n === root || n.startsWith(root + path.sep);
+    });
+  }
+
+  private relocateOwnedByOthers(
+    owners: readonly HookPeerFolder[],
+    leaving = false
+  ): boolean {
     const n =
       rehomeDisplacedPairs(
         this.stateDir,
         this.workspaceRoot,
         owners,
         "baselines",
-        this.log
+        this.log,
+        leaving
       ) +
       rehomeDisplacedPairs(
         this.stateDir,
         this.workspaceRoot,
         owners,
         "pending",
-        this.log
+        this.log,
+        leaving
       );
     if (n > 0) {
       this.markStateWrite();
@@ -435,10 +471,19 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
     if (!peer || normalizePath(peer.root) === this.normalizedRoot) {
       return false;
     }
+    if (otherWindowHoldsFolder(this.stateDir, this.workspaceRoot, peer.root)) {
+      return false;
+    }
     let any = false;
     const pairs: { src: string; destDir: string }[] = [
-      { src: this.baselinePath(absPath), destDir: baselinesDir(peer.stateDir) },
-      { src: this.pendingPath(absPath), destDir: pendingDir(peer.stateDir) },
+      {
+        src: this.ownBaselinePath(absPath),
+        destDir: baselinesDir(peer.stateDir),
+      },
+      {
+        src: this.ownPendingPath(absPath),
+        destDir: pendingDir(peer.stateDir),
+      },
     ];
     for (const { src, destDir } of pairs) {
       const result = relocateStatePair(src, destDir);
@@ -676,11 +721,20 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
   // --- disk layout ---------------------------------------------------------
 
   private baselinePath(absPath: string): string {
-    return path.join(baselinesDir(this.stateDir), pathKey(absPath));
+    return locateStatePair(
+      absPath,
+      this.relatedStores(),
+      "baselines",
+      this.stateDir
+    );
   }
 
-  private pendingPath(absPath: string): string {
-    return path.join(pendingDir(this.stateDir), pathKey(absPath));
+  private ownBaselinePath(absPath: string): string {
+    return ownStatePair(absPath, this.stateDir, "baselines");
+  }
+
+  private ownPendingPath(absPath: string): string {
+    return ownStatePair(absPath, this.stateDir, "pending");
   }
 
   private markStateWrite(): void {
@@ -716,7 +770,7 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
     content: string,
     created = this.createdFiles.has(absPath)
   ): boolean {
-    const target = this.baselinePath(absPath);
+    const target = this.ownBaselinePath(absPath);
     this.markStateWrite();
     // The sidecar goes first, and its result is checked. `baselinePaths()`
     // enumerates content files and used to treat one with an unreadable sidecar as
@@ -761,8 +815,44 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
 
   /** Every path that currently has a baseline on disk, with its creation flag. */
   private baselinePaths(): { path: string; created: boolean }[] {
-    const dir = baselinesDir(this.stateDir);
+    const stores = this.relatedStores();
+    const inScope = new PathSet();
+    this.collectBaselines(baselinesDir(this.stateDir), inScope, true);
+    for (const folder of descendantFolderStores(
+      this.stateDir,
+      this.workspaceRoot
+    )) {
+      this.collectBaselines(baselinesDir(folder.stateDir), inScope, false);
+    }
     const paths: { path: string; created: boolean }[] = [];
+    for (const absPath of inScope.values()) {
+      const contentPath = locateStatePair(
+        absPath,
+        stores,
+        "baselines",
+        this.stateDir
+      );
+      const sidecar = readSidecar(contentPath);
+      if (
+        !sidecar ||
+        !this.isInScope(sidecar.path) ||
+        this.isIgnored(sidecar.path)
+      ) {
+        continue;
+      }
+      paths.push({
+        path: sidecar.path,
+        created: sidecar.created === true,
+      });
+    }
+    return paths;
+  }
+
+  private collectBaselines(
+    dir: string,
+    inScope: PathSet,
+    allowDelete: boolean
+  ): void {
     for (const name of listDir(dir)) {
       if (name.endsWith(".json") || name.endsWith(".tmp")) {
         continue;
@@ -790,8 +880,11 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
         }
         // Unusable: the content is there but nothing says which file it belongs
         // to. Leaving it would keep it forever, since nothing can ever match it.
-        this.log(`dropping orphaned baseline ${name} (no sidecar)`);
-        removeFile(contentPath);
+        // Foreign stores are another window's: do not delete there.
+        if (allowDelete) {
+          this.log(`dropping orphaned baseline ${name} (no sidecar)`);
+          removeFile(contentPath);
+        }
         continue;
       }
       if (!this.isInScope(sidecar.path)) {
@@ -805,9 +898,8 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
         // after the rule is removed — may still need the recorded original.
         continue;
       }
-      paths.push({ path: sidecar.path, created: sidecar.created === true });
+      inScope.add(sidecar.path);
     }
-    return paths;
   }
 
   /**
@@ -1468,12 +1560,12 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
   /** Mark a path fully reviewed: delete its state and stop tracking it. */
   private resolve(absPath: string, silent = false): void {
     this.markStateWrite();
-    const baseline = this.baselinePath(absPath);
+    const baseline = this.ownBaselinePath(absPath);
     removeFile(baseline);
     removeFile(sidecarPath(baseline));
     // A staged pre-edit copy left behind by a Pre hook whose Post never ran
     // would otherwise be promoted as the baseline for a much later edit.
-    const pending = this.pendingPath(absPath);
+    const pending = this.ownPendingPath(absPath);
     removeFile(pending);
     removeFile(sidecarPath(pending));
 
