@@ -97,8 +97,6 @@ desktop.ini
 # The installer keeps one rollback copy before its first write to either file.
 .claude/settings.json.bak
 .claude/settings.local.json.bak
-# Local dump of Claude Code hook payloads (not written by this extension).
-.claude/codediff.txt
 CLAUDE.local.md
 
 # Fixture workspace state created by the integration tests. Scoped to the
