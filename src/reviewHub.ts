@@ -26,12 +26,15 @@ import {
   atomicWrite,
   ensureDir,
   folderStateDir,
+  hookPeersWindowFile,
   HookPeerFolder,
   HOOK_PEERS_FILE,
   legacyWorkspaceFallbackStateDir,
   moveDir,
   normalizePath,
   owningRoot,
+  readHookPeerRegistrations,
+  removeFile,
   serializeHookPeers,
   stateDirHasContent,
 } from "./util";
@@ -627,6 +630,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
   dispose(): void {
     this.disposed = true;
     this.folderListener.dispose();
+    this.withdrawHookPeers();
     this.disposeSessions();
     this._onDidChange.dispose();
     this._onDidDetect.dispose();
@@ -650,19 +654,45 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
   }
 
   /**
-   * Tell every folder's hook which other folders are in this window. Claude only
-   * loads hooks from the project it was started in, so a Bash call in repo A
-   * would otherwise never photograph sibling repo B.
+   * Tell every folder's hook which folders any open window wants photographed.
+   * Claude only loads hooks from the project it was started in, so a Bash call
+   * in repo A would otherwise never photograph sibling repo B.
+   *
+   * Each window writes its own file; `peers.json` is the union. A browsing
+   * window that opens A alone must not replace the A+B list another window
+   * published.
    */
   private publishHookPeers(): void {
-    const folders = this.getFolders().map((s) => ({
-      root: s.root,
-      stateDir: s.stateDir,
-    }));
+    const folders = this.peerFolderList();
     const text = serializeHookPeers(folders);
+    const windowId = vscode.env.sessionId;
     for (const session of this.getFolders()) {
-      atomicWrite(path.join(session.stateDir, HOOK_PEERS_FILE), text);
+      atomicWrite(hookPeersWindowFile(session.stateDir, windowId), text);
+      this.writeHookPeersUnion(session);
     }
+  }
+
+  private withdrawHookPeers(): void {
+    for (const session of this.getFolders()) {
+      this.withdrawHookPeersFrom(session);
+    }
+  }
+
+  private withdrawHookPeersFrom(session: FolderSession): void {
+    removeFile(hookPeersWindowFile(session.stateDir, vscode.env.sessionId));
+    this.writeHookPeersUnion(session);
+  }
+
+  private writeHookPeersUnion(session: FolderSession): void {
+    atomicWrite(
+      path.join(session.stateDir, HOOK_PEERS_FILE),
+      serializeHookPeers(
+        readHookPeerRegistrations(session.stateDir, {
+          root: session.root,
+          stateDir: session.stateDir,
+        })
+      )
+    );
   }
 
   private applyPeerFolders(): void {
@@ -723,8 +753,10 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
       if (!seen.has(key)) {
         // Nested folder leaving: hand its queue to whichever remaining root
         // still contains the file. A sibling leaving keeps its own state dir.
-        session.store.setPeerFolders(remaining);
-        session.store.rehomeDisplaced();
+        // Ownership is the remaining folders only — including this one in the
+        // set would keep nested files here as if the folder were still open.
+        this.withdrawHookPeersFrom(session);
+        session.store.rehomeToward(remaining);
         session.dispose();
         this.sessions.delete(key);
         changed = true;

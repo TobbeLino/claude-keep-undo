@@ -21,12 +21,14 @@ import {
   normalizePath,
   readFileBytesResult,
   readFileResult,
+  readHookPeerRegistrations,
   readSidecar,
   rehomeDisplacedPairs,
   relocateStatePair,
   serializeHookPeers,
   sidecarPath,
   uniqueSuffix,
+  unionHookPeers,
 } from "../../util";
 
 let tmp: string;
@@ -398,6 +400,35 @@ describe("hook peers", () => {
     assert.deepEqual(parseHookPeers(mixed, a), [a, b]);
   });
 
+  it("unions two windows instead of letting the last one win", () => {
+    const a = { root: path.join(tmp, "repo-a"), stateDir: "/state/a" };
+    const b = { root: path.join(tmp, "repo-b"), stateDir: "/state/b" };
+    assert.deepEqual(unionHookPeers([[a, b], [a]], a), [a, b]);
+  });
+
+  it("combines per-window registrations on disk", () => {
+    const a = {
+      root: path.join(tmp, "peer-a"),
+      stateDir: path.join(tmp, "state-a"),
+    };
+    const b = {
+      root: path.join(tmp, "peer-b"),
+      stateDir: path.join(tmp, "state-b"),
+    };
+    const stateDir = path.join(tmp, "peer-reg");
+    atomicWrite(
+      path.join(stateDir, "peers.d", "window-ab.json"),
+      serializeHookPeers([a, b])
+    );
+    atomicWrite(
+      path.join(stateDir, "peers.d", "window-a.json"),
+      serializeHookPeers([a])
+    );
+    const combined = readHookPeerRegistrations(stateDir, a);
+    const roots = combined.map((f) => f.root).sort();
+    assert.deepEqual(roots, [a.root, b.root].sort());
+  });
+
   it("gives a sibling path to that sibling's folder", () => {
     const a = { root: path.join(tmp, "repo-a"), stateDir: "/state/a" };
     const b = { root: path.join(tmp, "repo-b"), stateDir: "/state/b" };
@@ -467,7 +498,10 @@ describe("rehomeDisplacedPairs", () => {
     const n = rehomeDisplacedPairs(
       outerState,
       outer,
-      [{ root: inner, stateDir: innerState }],
+      [
+        { root: outer, stateDir: outerState },
+        { root: inner, stateDir: innerState },
+      ],
       "baselines"
     );
     assert.equal(n, 1);
@@ -504,6 +538,35 @@ describe("rehomeDisplacedPairs", () => {
       "from-inner\n"
     );
     assert.equal(fs.existsSync(content), false);
+  });
+
+  it("keeps a nested file in the inner store when that folder is still open", () => {
+    const outer = path.join(tmp, "mono-stay");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "keep.ts");
+    const innerState = path.join(tmp, "state-inner-stay");
+    const outerState = path.join(tmp, "state-outer-stay");
+    const key = pathKey(nested);
+    const content = path.join(innerState, "baselines", key);
+    atomicWrite(content, "stay-inner\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: nested, ts: 1 }));
+
+    const n = rehomeDisplacedPairs(
+      innerState,
+      inner,
+      [
+        { root: inner, stateDir: innerState },
+        { root: outer, stateDir: outerState },
+      ],
+      "baselines"
+    );
+    assert.equal(n, 0);
+    assert.equal(fs.readFileSync(content, "utf8"), "stay-inner\n");
+    assert.equal(
+      fs.existsSync(path.join(outerState, "baselines", key)),
+      false,
+      "the outer store must not take a file the inner folder itself owns"
+    );
   });
 });
 

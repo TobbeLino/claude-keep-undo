@@ -894,9 +894,9 @@ describe("Keep / Undo for Claude Code", () => {
       );
     });
 
-    it("drops a baseline that a rule reaches after it was written", async () => {
+    it("hides a baseline that a rule reaches after it was written", async () => {
       // The hook may have captured the file before the rule existed, or with an
-      // older descriptor. The sweep is what makes the rule retroactive.
+      // older descriptor. The sweep is what takes it out of this window's queue.
       const file = makeFile("it-generated.ts", "export const a = 2;\n");
       seedBaseline(file, "export const a = 1;\n");
       await vscode.commands.executeCommand("claudeKeepUndo.refresh");
@@ -912,8 +912,8 @@ describe("Keep / Undo for Claude Code", () => {
       );
       assert.equal(
         fileExists(path.join(baselinesDir(stateDir), pathKey(file))),
-        false,
-        "its recorded original must be deleted, not merely hidden"
+        true,
+        "its recorded original stays on disk for another window, or if the rule is removed"
       );
     });
 

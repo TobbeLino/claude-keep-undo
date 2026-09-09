@@ -36,13 +36,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **A Claude session started in one folder captures the others too.** The hook
   photographs every workspace repo on a shell command, and routes Edit/Write
   files into the owning folder's queue — so a `printf > sibling/file` shows up
-  under that sibling, not only the session's own repo.
+  under that sibling, not only the session's own repo. Each window registers
+  its own folder list (`peers.d/`); the hook reads the combined list, so
+  opening one of those repos alone in a second window no longer disables
+  capture of the others.
 - **Pending reviews survive a window that does not own them.** Opening the same
   folder with different siblings, or with `trackOutsideWorkspace` off, no longer
   deletes baselines that are out of this window's scope — they stay on disk and
   reappear when a window that owns them loads. Adding or removing a nested
   folder *moves* the recorded original into the folder that owns the file, so
-  the review is kept once and is not duplicated.
+  the review is kept once and is not duplicated. Ownership includes the folder
+  itself, so a nested store does not bounce its own files back to the outer
+  one. A window that only has the outer folder will not list files whose
+  state already lives in a nested folder's store; add the nested folder to
+  find them.
+- **Ignore rules hide existing reviews rather than delete them.** A browsing
+  window with different `ignore.patterns` no longer wipes another window's
+  recorded originals. New captures are still refused. Removing the rule can
+  bring the review back.
 - **Undo finds a file Git and VS Code spell differently.** On Windows a
   shell-created file was listed in the queue (git's `D:\...`) while Undo from
   the editor looked up `d:\...`, reported nothing to undo, and left the file on

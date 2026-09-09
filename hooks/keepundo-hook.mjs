@@ -17,9 +17,10 @@
  * subdirectory, and it would put verbatim copies of the user's source inside
  * their repository.
  *
- * In a multi-root window the extension also publishes `peers.json` next to
- * that state. A session started in one folder then photographs every workspace
- * repo on a Bash call, and routes Edit/Write files into the owning folder.
+ * In a multi-root window the extension also publishes `peers.d/` (one file per
+ * window) and a combined `peers.json` next to that state. A session started in
+ * one folder then photographs every workspace repo those windows want captured,
+ * and routes Edit/Write files into the owning folder.
  *
  * This script must never block a tool call: it always exits 0 and swallows
  * errors, so a problem here can never interfere with Claude Code.
@@ -100,36 +101,69 @@ function isInside(root, absPath) {
 }
 
 /**
- * Every workspace folder the extension currently has open. Must match
- * `parseHookPeers` / `HOOK_PEERS_FILE` in the extension's util.ts.
+ * Every workspace folder any open window wants photographed. Must match
+ * `readHookPeerRegistrations` in the extension's util.ts.
  *
  * Claude Code only loads hooks from the project it was started in, so a Bash
- * call in repo A would otherwise never photograph sibling repo B. The extension
- * publishes this list into every folder's state directory.
+ * call in repo A would otherwise never photograph sibling repo B. Each window
+ * writes `peers.d/<window>.json`; `peers.json` is the combined list.
  */
 function loadHookPeers(stateDir, selfRoot) {
-  let parsed;
-  try {
-    parsed = JSON.parse(
-      fs.readFileSync(path.join(stateDir, "peers.json"), "utf8")
-    );
-  } catch {
-    parsed = undefined;
-  }
   const fallback = selfRoot ? [{ root: selfRoot, stateDir }] : [];
-  if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.folders)) {
-    return fallback;
+  const lists = [];
+  try {
+    for (const name of fs.readdirSync(path.join(stateDir, "peers.d"))) {
+      if (!name.endsWith(".json") || name.endsWith(".tmp")) {
+        continue;
+      }
+      const folders = readPeersFile(path.join(stateDir, "peers.d", name));
+      if (folders.length > 0) {
+        lists.push(folders);
+      }
+    }
+  } catch {
+    /* missing dir */
   }
-  const folders = [];
-  for (const item of parsed.folders) {
-    if (
-      item &&
-      typeof item.root === "string" &&
-      typeof item.stateDir === "string"
-    ) {
-      folders.push({ root: item.root, stateDir: item.stateDir });
+  if (lists.length > 0) {
+    return unionPeerLists(lists, fallback);
+  }
+  const combined = readPeersFile(path.join(stateDir, "peers.json"));
+  return combined.length > 0 ? combined : fallback;
+}
+
+function readPeersFile(filePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.folders)) {
+      return [];
+    }
+    const folders = [];
+    for (const item of parsed.folders) {
+      if (
+        item &&
+        typeof item.root === "string" &&
+        typeof item.stateDir === "string"
+      ) {
+        folders.push({ root: item.root, stateDir: item.stateDir });
+      }
+    }
+    return folders;
+  } catch {
+    return [];
+  }
+}
+
+function unionPeerLists(lists, fallback) {
+  const byRoot = new Map();
+  for (const list of lists) {
+    for (const folder of list) {
+      const resolved = path.resolve(folder.root);
+      const key =
+        process.platform === "linux" ? resolved : resolved.toLowerCase();
+      byRoot.set(key, folder);
     }
   }
+  const folders = [...byRoot.values()];
   return folders.length > 0 ? folders : fallback;
 }
 
@@ -1095,8 +1129,9 @@ async function main() {
 
   // Scope to a folder VS Code has open. Claude only runs this script from the
   // project it was started in, so a Write in a sibling repo used to be dropped
-  // here. `peers.json` lists every folder in the window; capture into the
-  // owning folder's state directory so that folder's watcher sees it.
+  // here. The published peer list covers every folder any open window wants
+  // photographed; capture into the owning folder's state directory so that
+  // folder's watcher sees it.
   const peers = loadHookPeers(stateDir, root);
   const owner = owningPeer(peers, filePath);
   let captureState = stateDir;

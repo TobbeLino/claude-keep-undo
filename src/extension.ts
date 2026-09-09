@@ -604,8 +604,8 @@ export function activate(
   context.subscriptions.push(
     // A rule can start matching files that are already in the queue — the user
     // edited `.keepundoignore` by hand, pulled a colleague's, or changed a
-    // setting. Those files leave the queue and their recorded originals are
-    // deleted, so the change is announced rather than simply happening.
+    // setting. Those files leave this window's queue; the recorded originals
+    // stay, so the change is announced rather than simply happening.
     hub.onDidDropIgnored((left) => {
       statusChanged.fire();
       void vscode.window
@@ -717,9 +717,9 @@ function explainNoHunk(ref: "baseline-side" | undefined): string {
  * take files out of the review queue.
  *
  * That confirmation is the whole reason this is not a one-liner. Excluding a
- * file with changes waiting deletes its recorded original, which is what makes
- * those changes permanent — the same outcome as Keep, reached from a menu item
- * that does not say so.
+ * file with changes waiting takes it out of this window's queue. The recorded
+ * original stays, so another window is not wiped and removing the rule can
+ * restore the review.
  */
 async function addIgnoreRule(
   store: ReviewStore,
@@ -766,8 +766,9 @@ async function addIgnoreRule(
       {
         modal: true,
         detail:
-          `${waiting} Those changes will be kept, and the recorded originals ` +
-          "deleted — after this they can no longer be undone.\n\n" +
+          `${waiting} Those changes leave this window's review queue. The ` +
+          "recorded originals stay on disk, so another window is not wiped " +
+          "and removing the rule can bring the review back.\n\n" +
           `The rule \`${pattern}\` is added to ${IGNORE_FILE_NAME}, where you can remove it again.`,
       },
       "Add Rule"

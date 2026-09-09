@@ -182,9 +182,11 @@ export function pathIsInFolderScope(
   return trackOutside;
 }
 
-/** Published into every folder's state dir so a hook running in one repo can
- *  snapshot and capture files that belong to a sibling in this window. */
+/** Combined peer list the hook reads. Union of every window's registration. */
 export const HOOK_PEERS_FILE = "peers.json";
+
+/** Per-window peer registrations. Last-writer must not replace another window. */
+export const HOOK_PEERS_DIR = "peers.d";
 
 export interface HookPeerFolder {
   root: string;
@@ -204,13 +206,20 @@ export function parseHookPeers(
   raw: string | undefined,
   fallback: HookPeerFolder
 ): HookPeerFolder[] {
+  return parseHookPeersList(raw) ?? [fallback];
+}
+
+/** Well-formed folder list, or `undefined` when the payload cannot be used. */
+export function parseHookPeersList(
+  raw: string | undefined
+): HookPeerFolder[] | undefined {
   if (!raw) {
-    return [fallback];
+    return undefined;
   }
   try {
     const parsed = JSON.parse(raw) as { v?: unknown; folders?: unknown };
     if (parsed.v !== 1 || !Array.isArray(parsed.folders)) {
-      return [fallback];
+      return undefined;
     }
     const folders: HookPeerFolder[] = [];
     for (const item of parsed.folders) {
@@ -222,10 +231,62 @@ export function parseHookPeers(
         folders.push({ root: rec.root, stateDir: rec.stateDir });
       }
     }
-    return folders.length > 0 ? folders : [fallback];
+    return folders.length > 0 ? folders : undefined;
   } catch {
-    return [fallback];
+    return undefined;
   }
+}
+
+/** One folder per root, last occurrence wins. Empty input yields `fallback`. */
+export function unionHookPeers(
+  lists: readonly HookPeerFolder[][],
+  fallback: HookPeerFolder
+): HookPeerFolder[] {
+  const byRoot = new Map<string, HookPeerFolder>();
+  for (const list of lists) {
+    for (const folder of list) {
+      byRoot.set(normalizePath(folder.root), folder);
+    }
+  }
+  const folders = [...byRoot.values()];
+  return folders.length > 0 ? folders : [fallback];
+}
+
+export function hookPeersWindowFile(
+  stateDir: string,
+  windowId: string
+): string {
+  return path.join(stateDir, HOOK_PEERS_DIR, `${pathKey(windowId)}.json`);
+}
+
+/**
+ * Folders any currently registered window wants photographed. Per-window files
+ * are the source of truth; `peers.json` is the combined list written for the
+ * hook, and the fallback when no window file exists yet.
+ */
+export function readHookPeerRegistrations(
+  stateDir: string,
+  fallback: HookPeerFolder
+): HookPeerFolder[] {
+  const lists: HookPeerFolder[][] = [];
+  for (const name of listDir(path.join(stateDir, HOOK_PEERS_DIR))) {
+    if (!name.endsWith(".json") || name.endsWith(".tmp")) {
+      continue;
+    }
+    const raw = readFileSafe(path.join(stateDir, HOOK_PEERS_DIR, name));
+    const parsed = parseHookPeersList(raw);
+    if (parsed) {
+      lists.push(parsed);
+    }
+  }
+  if (lists.length > 0) {
+    return unionHookPeers(lists, fallback);
+  }
+  return (
+    parseHookPeersList(readFileSafe(path.join(stateDir, HOOK_PEERS_FILE))) ?? [
+      fallback,
+    ]
+  );
 }
 
 /** The peer folder that owns this path, or undefined when none contains it. */
@@ -302,21 +363,21 @@ export function relocateStatePair(
 }
 
 /**
- * Move baselines or stagings in `sourceStateDir` that a *peer* folder owns
- * into that peer's state directory.
+ * Move baselines or stagings whose owner (among `owners`) is not this folder
+ * into that owner's state directory.
  *
- * Used when a nested folder is added (outer → inner) or removed (inner →
- * whatever still contains the path). Files no peer owns are left where they
- * are: another window's layout or `trackOutsideWorkspace` must not delete them.
+ * `owners` must include this folder when it is still in the window: otherwise a
+ * nested inner store would treat the outer peer as the owner and bounce the
+ * file back. When this folder is *leaving*, pass only the folders that remain.
  */
 export function rehomeDisplacedPairs(
   sourceStateDir: string,
   selfRoot: string,
-  peers: readonly HookPeerFolder[],
+  owners: readonly HookPeerFolder[],
   kind: "baselines" | "pending",
   log?: (msg: string) => void
 ): number {
-  if (peers.length === 0) {
+  if (owners.length === 0) {
     return 0;
   }
   const sourceDir =
@@ -334,7 +395,7 @@ export function rehomeDisplacedPairs(
     if (!sidecar) {
       continue;
     }
-    const owner = owningPeer(peers, sidecar.path);
+    const owner = owningPeer(owners, sidecar.path);
     if (!owner || normalizePath(owner.root) === self) {
       continue;
     }
@@ -447,8 +508,11 @@ export function claudeFileHistoryDir(): string {
 //   pending/<key>.json              { path, ts } sidecar — `ts` expires stagings
 //   snapshots/<key>-<ts>            pre-Undo safety copies
 //   ignore.json                     ignore rules published for the hook process
-//   peers.json                      every folder in this window, so a hook
-//                                   running in one repo can capture the others
+//   peers.d/<window>.json           this window's folders, so another window
+//                                   cannot overwrite the combined peer list
+//   peers.json                      union of every window's registration, for
+//                                   the hook running in one repo to capture
+//                                   the others
 //   events.ndjson                   append-only hook event log (size-capped)
 //
 // Keyed by the folder path so the same repo keeps its review queue when opened

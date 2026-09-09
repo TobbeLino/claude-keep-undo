@@ -352,7 +352,8 @@ another workspace:
 ├── bash/repo.json         the cached Git toplevel, so it is not re-derived per call
 ├── unreviewable/<key>.json a file the hook could not recover, and why; drained and deleted
 ├── ignore.json            the ignore rules, published for the hook process
-├── peers.json             every folder in this window, so one repo's hook can capture the others
+├── peers.d/<window>.json  this window's folders (one file per VS Code window)
+├── peers.json             union of every window's registration, for the hook
 └── events.ndjson          size-capped log of hook events
 ```
 
@@ -365,11 +366,13 @@ window may still be reviewing that file (different folders, or
 `trackOutsideWorkspace` off here and on there). Adding a nested workspace folder
 moves the recorded original from the outer folder's state into the inner one;
 removing the nested folder moves it back. Two folders never keep a copy of the
-same path. An ignore rule that applies to a file this folder *does* own still
-deletes that copy — that is "stop reviewing this file." Workspace-scoped
-`ignore.patterns` in another `.code-workspace` that also opens this folder can
-therefore still drop reviews; a `.keepundoignore` in the repo cannot surprise
-you that way, because every window reads the same file.
+same path. A window that only has the outer folder will not list files whose
+state already lives in the inner store — add the nested folder to find them.
+
+An ignore rule in this window **hides** an existing review rather than deleting
+it. Workspace-scoped `ignore.patterns` in a browsing `.code-workspace` therefore
+no longer wipe another window's queue; a `.keepundoignore` in the repo is still
+shared, but it also only hides. New captures of ignored files are still refused.
 
 `baselines/` and `snapshots/` hold verbatim copies of your source files —
 including whatever secrets those files contain. Keeping them outside the
@@ -446,14 +449,15 @@ that exact path into `.keepundoignore`, creating the file from a commented
 template if it does not exist.
 
 If the file has changes waiting, the command says so and asks first, because
-excluding it **keeps** them: the recorded original is deleted along with the
-queue entry, and after that they can no longer be undone. The same thing happens
-— with a notification rather than a dialog — when a rule you add by hand, or one
-that arrives from a colleague, starts matching a file already in the queue.
+excluding it takes the file out of this window's queue. The recorded original
+stays on disk: another window may still be reviewing it, and removing the rule
+can bring the review back. The same thing happens — with a notification rather
+than a dialog — when a rule you add by hand, or one that arrives from a
+colleague, starts matching a file already in the queue.
 
-Removing a rule does not bring anything back. There is nothing to review against
-once the recorded original is gone; the next edit Claude makes to the file starts
-it over.
+Removing a rule can restore a review that was only hidden. If the recorded
+original was never captured (the file was ignored before Claude touched it),
+the next edit Claude makes starts it over.
 
 ---
 
