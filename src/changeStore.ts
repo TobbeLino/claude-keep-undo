@@ -22,6 +22,7 @@ import {
   locateStatePair,
   ownStatePair,
   ensureDir,
+  existingStatePairs,
   fileExists,
   HookPeerFolder,
   legacyStateDir,
@@ -40,10 +41,11 @@ import {
   readFileBytesResult,
   readFileSafe,
   readSidecar,
-  descendantFolderStores,
+  relatedFolderStores,
   rehomeDisplacedPairs,
   relocateStatePair,
   removeFile,
+  removeStatePairs,
   sidecarPath,
   snapshotsDir,
   uniqueSuffix,
@@ -412,17 +414,18 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
   }
 
   /**
-   * This folder plus nested folders whose state we surface.
+   * This folder plus parent and nested folder stores on disk.
    *
-   * Parent stores are omitted on purpose: listing them would pull another
-   * window's originals into this queue, and Keep/Undo here would then look
-   * like they failed — or would delete those originals. Outer-only windows
-   * still see inner captures because those stores are descendants.
+   * An outer-only window lists reviews that already live in a nested store;
+   * a nested window lists reviews that still live in the parent store. Sibling
+   * repos share the `folders/` directory but are not related. Each store still
+   * only queues files it owns, so one window does not show the same nested
+   * file on both folder rows.
    */
   private relatedStores(): HookPeerFolder[] {
     return [
       { root: this.workspaceRoot, stateDir: this.stateDir },
-      ...descendantFolderStores(this.stateDir, this.workspaceRoot),
+      ...relatedFolderStores(this.stateDir, this.workspaceRoot),
     ];
   }
 
@@ -770,14 +773,53 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
     content: string,
     created = this.createdFiles.has(absPath)
   ): boolean {
-    const target = this.ownBaselinePath(absPath);
+    const stores = this.relatedStores();
+    const displayed = locateStatePair(
+      absPath,
+      stores,
+      "baselines",
+      this.stateDir
+    );
+    const existing = existingStatePairs(absPath, stores, "baselines");
+    const targets =
+      existing.length > 0
+        ? [
+            displayed,
+            ...existing.filter(
+              (contentPath) =>
+                normalizePath(contentPath) !== normalizePath(displayed)
+            ),
+          ]
+        : [displayed];
     this.markStateWrite();
-    // The sidecar goes first, and its result is checked. `baselinePaths()`
-    // enumerates content files and used to treat one with an unreadable sidecar as
-    // an orphan to delete, so a content file that outlived a failed sidecar write
-    // was destroyed by the next sweep — taking every unreviewed change in that
-    // file with it, after the UI had already reported the action as applied. A
-    // sidecar with no content behind it, by contrast, is simply never looked at.
+    for (const target of targets) {
+      if (!this.writeBaselineAt(target, absPath, content, created)) {
+        return false;
+      }
+    }
+    if (created) {
+      this.createdFiles.add(absPath);
+    } else {
+      this.createdFiles.delete(absPath);
+    }
+    return true;
+  }
+
+  /**
+   * Write one baseline content+sidecar pair. The sidecar goes first, and its
+   * result is checked. `baselinePaths()` enumerates content files and used to
+   * treat one with an unreadable sidecar as an orphan to delete, so a content
+   * file that outlived a failed sidecar write was destroyed by the next sweep
+   * — taking every unreviewed change in that file with it, after the UI had
+   * already reported the action as applied. A sidecar with no content behind
+   * it, by contrast, is simply never looked at.
+   */
+  private writeBaselineAt(
+    target: string,
+    absPath: string,
+    content: string,
+    created: boolean
+  ): boolean {
     const previous = readFileSafe(sidecarPath(target));
     if (
       !this.writeSidecar(
@@ -805,11 +847,6 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
       }
       return false;
     }
-    if (created) {
-      this.createdFiles.add(absPath);
-    } else {
-      this.createdFiles.delete(absPath);
-    }
     return true;
   }
 
@@ -818,7 +855,7 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
     const stores = this.relatedStores();
     const inScope = new PathSet();
     this.collectBaselines(baselinesDir(this.stateDir), inScope, true);
-    for (const folder of descendantFolderStores(
+    for (const folder of relatedFolderStores(
       this.stateDir,
       this.workspaceRoot
     )) {
@@ -1560,14 +1597,12 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
   /** Mark a path fully reviewed: delete its state and stop tracking it. */
   private resolve(absPath: string, silent = false): void {
     this.markStateWrite();
-    const baseline = this.ownBaselinePath(absPath);
-    removeFile(baseline);
-    removeFile(sidecarPath(baseline));
-    // A staged pre-edit copy left behind by a Pre hook whose Post never ran
-    // would otherwise be promoted as the baseline for a much later edit.
-    const pending = this.ownPendingPath(absPath);
-    removeFile(pending);
-    removeFile(sidecarPath(pending));
+    const stores = this.relatedStores();
+    // Explicit Keep/Undo must clear the copy the user reviewed, including one
+    // inherited from a parent or nested store — otherwise the next refresh
+    // rediscovers it. Passive browsing never calls this.
+    removeStatePairs(absPath, stores, "baselines");
+    removeStatePairs(absPath, stores, "pending");
 
     this.tracked.delete(absPath);
     this.userTouched.delete(absPath);

@@ -368,13 +368,14 @@ window may still be reviewing that file (different folders, or
 in the _same_ window moves the recorded original from the outer folder's state
 into the inner one; removing it moves it back. Opening a nested layout in
 _another_ window does not move or delete those copies — merely opening a repo
-must not make Keep/Undo in the first window restore nothing. Each window writes
-only into its own store, so Keep and Undo there cannot destroy another window's
-original. Related stores may therefore both hold a copy of the same path. A
-window that only has the outer folder still lists files whose state already
-lives in a nested store; it does not pull a parent store's copy into an inner
-queue. Window registrations in `peers.d/` expire if that window stops rewriting
-them, and an empty `peers.d` is "this folder only", not the last combined list.
+must not make Keep/Undo in the first window restore nothing. Each window lists
+reviews that already live in a parent or nested store, filtered by which folder
+owns the file. An explicit Keep or Undo applies to the copy being reviewed,
+including one inherited from a related store, so the decision is visible
+wherever that entry is displayed. Passive browsing still never deletes another
+window's original. Window registrations in `peers.d/` expire if that window
+stops rewriting them, and an empty `peers.d` is "this folder only", not the last
+combined list.
 
 An ignore rule in this window **hides** an existing review rather than deleting
 it. Workspace-scoped `ignore.patterns` in a browsing `.code-workspace` therefore

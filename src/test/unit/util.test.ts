@@ -12,6 +12,7 @@ import {
   isInsideRoot,
   isUtf8Text,
   listDir,
+  existingStatePairs,
   locateStatePair,
   ownStatePair,
   looksBinary,
@@ -31,6 +32,7 @@ import {
   relatedFolderStores,
   rehomeDisplacedPairs,
   relocateStatePair,
+  removeStatePairs,
   serializeHookPeerRegistration,
   serializeHookPeers,
   sidecarPath,
@@ -721,6 +723,31 @@ describe("locateStatePair", () => {
     assert.equal(fs.readFileSync(innerContent, "utf8"), "only-inner\n");
   });
 
+  it("falls back to a parent store when the nested window has no copy", () => {
+    const outer = path.join(tmp, "mono-parent");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "from-parent.ts");
+    const outerState = path.join(tmp, "state-outer-parent");
+    const innerState = path.join(tmp, "state-inner-parent");
+    const outerContent = path.join(outerState, "baselines", pathKey(nested));
+    atomicWrite(outerContent, "only-outer\n");
+    atomicWrite(
+      sidecarPath(outerContent),
+      JSON.stringify({ path: nested, ts: 1 })
+    );
+    const winner = locateStatePair(
+      nested,
+      [
+        { root: outer, stateDir: outerState },
+        { root: inner, stateDir: innerState },
+      ],
+      "baselines",
+      innerState
+    );
+    assert.equal(winner, outerContent);
+    assert.equal(fs.readFileSync(outerContent, "utf8"), "only-outer\n");
+  });
+
   it("keeps new writes in this window's store", () => {
     const outer = path.join(tmp, "mono-new");
     const inner = path.join(outer, "pkg");
@@ -756,6 +783,41 @@ describe("locateStatePair", () => {
       path.join(outerState, "baselines", pathKey(nested))
     );
     assert.equal(fs.readFileSync(innerContent, "utf8"), "related-copy\n");
+  });
+});
+
+describe("removeStatePairs", () => {
+  it("deletes every related copy so Keep cannot rediscover the original", () => {
+    const outer = path.join(tmp, "mono-rm");
+    const inner = path.join(outer, "pkg");
+    const nested = path.join(inner, "kept.ts");
+    const outerState = path.join(tmp, "state-outer-rm");
+    const innerState = path.join(tmp, "state-inner-rm");
+    const key = pathKey(nested);
+    const outerContent = path.join(outerState, "baselines", key);
+    const innerContent = path.join(innerState, "baselines", key);
+    atomicWrite(outerContent, "outer-original\n");
+    atomicWrite(
+      sidecarPath(outerContent),
+      JSON.stringify({ path: nested, ts: 1 })
+    );
+    atomicWrite(innerContent, "inner-copy\n");
+    atomicWrite(
+      sidecarPath(innerContent),
+      JSON.stringify({ path: nested, ts: 2 })
+    );
+    const stores = [
+      { root: outer, stateDir: outerState },
+      { root: inner, stateDir: innerState },
+    ];
+    assert.deepEqual(
+      existingStatePairs(nested, stores, "baselines").sort(),
+      [innerContent, outerContent].sort()
+    );
+    assert.equal(removeStatePairs(nested, stores, "baselines"), 2);
+    assert.equal(fs.existsSync(outerContent), false);
+    assert.equal(fs.existsSync(innerContent), false);
+    assert.equal(existingStatePairs(nested, stores, "baselines").length, 0);
   });
 });
 

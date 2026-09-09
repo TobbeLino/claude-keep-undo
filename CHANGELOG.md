@@ -30,7 +30,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Nested workspace folders:** the deepest root owns the file, so a repo
   opened inside another is not double-tracked. In the same window, existing
   reviews move with ownership rather than being dropped. A second window that
-  only opens the nested layout does not take or delete those originals.
+  only opens the nested layout does not take those originals; it lists them,
+  and Keep there resolves the copy being reviewed.
 - **The changes view groups by folder** when more than one root is open.
   Keep All / Undo All / Review on a folder row (or on that folder’s Source
   Control entry) apply only there.
@@ -48,11 +49,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   folder in the _same_ window _moves_ the recorded original into the folder
   that owns the file. Opening a nested layout in _another_ window does not
   move or delete those originals — a window that merely opens a repo must not
-  make other windows lose Keep/Undo. Each window writes only into its own
-  store; Keep and Undo there cannot destroy another window's copy. An
-  outer-only window still lists reviews that already live in a nested folder's
-  store. Ownership includes the folder itself, so a nested store does not
-  bounce its own files back to the outer one.
+  make other windows lose Keep/Undo. Nested windows still list reviews that
+  live in a parent store, and outer-only windows still list reviews that live
+  in a nested store. An explicit Keep or Undo applies to the copy being
+  reviewed, so the decision sticks wherever that entry is shown. Ownership
+  includes the folder itself, so a nested store does not bounce its own files
+  back to the outer one.
 - **Ignore rules hide existing reviews rather than delete them.** A browsing
   window with different `ignore.patterns` no longer wipes another window's
   recorded originals. New captures are still refused. Removing the rule can

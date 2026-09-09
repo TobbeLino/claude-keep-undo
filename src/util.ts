@@ -447,7 +447,9 @@ export function relatedFolderStores(
   return found;
 }
 
-/** Path of this folder's own baseline or staging for `absPath`, whether or not it exists yet. */
+/**
+ * Path of this folder's own baseline or staging for `absPath`, whether or not it exists yet.
+ */
 export function ownStatePair(
   absPath: string,
   stateDir: string,
@@ -458,15 +460,58 @@ export function ownStatePair(
 }
 
 /**
+ * Every related store that already has a baseline or staging for `absPath`.
+ *
+ * Used when an explicit Keep or Undo must update or remove the copy the user
+ * is looking at — including one that lives in a parent or nested store —
+ * without leaving a duplicate behind for the next refresh to rediscover.
+ */
+export function existingStatePairs(
+  absPath: string,
+  stores: readonly HookPeerFolder[],
+  kind: "baselines" | "pending"
+): string[] {
+  const seen = new Set<string>();
+  const found: string[] = [];
+  for (const folder of stores) {
+    const content = ownStatePair(absPath, folder.stateDir, kind);
+    const key = normalizePath(content);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    if (fileExists(content)) {
+      found.push(content);
+    }
+  }
+  return found;
+}
+
+/** Delete every related baseline or staging for `absPath`, with its sidecar. */
+export function removeStatePairs(
+  absPath: string,
+  stores: readonly HookPeerFolder[],
+  kind: "baselines" | "pending"
+): number {
+  let n = 0;
+  for (const content of existingStatePairs(absPath, stores, kind)) {
+    removeFile(content);
+    removeFile(sidecarPath(content));
+    n++;
+  }
+  return n;
+}
+
+/**
  * Path of the baseline or staging this window should *read* for `absPath`.
  *
- * This window's own store wins if it already has a copy — a browsing window
- * must not take over (or delete) another window's original. If this store has
- * none, fall back to a related store that does, so an outer-only window can
- * still list reviews that already live in a nested store.
+ * This window's own store wins if it already has a copy. If this store has
+ * none, fall back to a related store that does — parent or nested — so each
+ * window can list a review the other captured. New captures still land in
+ * `preferredStateDir`.
  *
- * Writes, Keep, and Undo must use {@link ownStatePair}: resolving a review
- * that was only inherited would delete the other window's original.
+ * Passive browsing must not move or delete the fallback copy. An explicit
+ * Keep or Undo applies to that copy (see {@link existingStatePairs}).
  */
 export function locateStatePair(
   absPath: string,
