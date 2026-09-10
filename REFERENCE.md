@@ -104,8 +104,10 @@ IDE-integrated assistant. This extension adds that step back.
   undoes it. All four are scoped to files Claude has actually changed, so they
   give the keys back everywhere else.
 - **Per-hunk CodeLens.** `Keep (+3 −1)` / `Undo` above each changed region, plus
-  `Keep all` / `Undo all` at the top of the file — inside the diff editor by
-  default, since every row displaces a line of code.
+  `Keep all` / `Undo all` at the top of the file when there is more than one
+  hunk. The hunk under the caret also gets `⬆️ prev` / `2 of 3` / `⬇️ next` on
+  the same inserted row — inside the diff editor by default, since every row
+  displaces a line of code.
 
 ### Across the whole review queue
 
@@ -724,7 +726,8 @@ npm run package     # npx @vscode/vsce package
 | `src/ui/codeActions.ts`              | Keep/Undo as Quick Fixes on the hunk under the cursor                           |
 | `src/ui/diffView.ts`                 | `claude-baseline:` content provider + diff opening                              |
 | `src/ui/fileDecorations.ts`          | Explorer badge                                                                  |
-| `src/ui/codeLens.ts`                 | Per-hunk and per-file Keep/Undo CodeLens                                        |
+| `src/ui/codeLens.ts`                 | Per-hunk and per-file Keep/Undo CodeLens, plus prev/next on the current hunk    |
+| `src/ui/hunkNav.ts`                  | Current/neighbor hunk index helpers for the CodeLens extras                     |
 | `src/ui/format.ts`                   | Shared hunk formatting helpers                                                  |
 | `src/test/unit/**`                   | Pure-logic tests (`node:test`)                                                  |
 | `src/test/integration/**`            | End-to-end tests in a real VS Code                                              |
