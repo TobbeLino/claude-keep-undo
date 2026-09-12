@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { ReviewStore } from "../changeStore";
 import { Hunk, hunkLineRange } from "../diff";
-import { BASELINE_SCHEME } from "../util";
+import { BASELINE_SCHEME, CURRENT_SCHEME } from "../util";
 import { summarizeHunk } from "./format";
 
 /**
@@ -27,7 +27,10 @@ export async function goToChange(
     );
     return;
   }
-  if (editor.document.uri.scheme !== "file") {
+  if (
+    editor.document.uri.scheme !== "file" &&
+    editor.document.uri.scheme !== CURRENT_SCHEME
+  ) {
     return;
   }
 

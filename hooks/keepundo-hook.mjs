@@ -20,7 +20,9 @@
  * In a multi-root window the extension also publishes `peers.d/` (one file per
  * window) and a combined `peers.json` next to that state. A session started in
  * one folder then photographs every workspace repo those windows want captured,
- * and routes Edit/Write files into the owning folder.
+ * and routes Edit/Write files into the owning folder. A peer with `bash: false`
+ * is skipped for shell-command snapshots (it is not a Git repository) but still
+ * receives Edit/Write files that belong under it.
  *
  * This script must never block a tool call: it always exits 0 and swallows
  * errors, so a problem here can never interfere with Claude Code.
@@ -164,7 +166,11 @@ function readPeersFile(filePath, requireFresh) {
         typeof item.root === "string" &&
         typeof item.stateDir === "string"
       ) {
-        folders.push({ root: item.root, stateDir: item.stateDir });
+        const folder = { root: item.root, stateDir: item.stateDir };
+        if (item.bash === false) {
+          folder.bash = false;
+        }
+        folders.push(folder);
       }
     }
     return folders;
@@ -664,7 +670,7 @@ const REMEDY_TURN_ON =
  * four checkouts measured).
  */
 function bashPre(payload, input, ctx) {
-  if (ctx.bash === "off") {
+  if (ctx.bash === "off" || ctx.skipBash) {
     return;
   }
   if (input.run_in_background === true) {
@@ -808,7 +814,7 @@ function bashPre(payload, input, ctx) {
  * a byte-exact baseline or a note saying why there is none.
  */
 function bashPost(payload, input, ctx) {
-  if (ctx.bash === "off" || input.run_in_background === true) {
+  if (ctx.bash === "off" || ctx.skipBash || input.run_in_background === true) {
     return;
   }
   const snap = loadBashSnapshot();
@@ -1147,6 +1153,7 @@ async function main() {
         rootReal,
         cwd,
         bash: bashMode,
+        skipBash: folder.bash === false,
         ignore: loadIgnoreRules(folder.stateDir, folder.root),
         note,
       };

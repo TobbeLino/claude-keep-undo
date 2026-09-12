@@ -6,6 +6,7 @@ import { after, before, describe, it } from "node:test";
 import {
   atomicCopy,
   atomicWrite,
+  CURRENT_SCHEME,
   descendantFolderStores,
   encodeProjectDir,
   HOOK_PEERS_TTL_MS,
@@ -289,6 +290,10 @@ describe("sidecars", () => {
 });
 
 describe("path helpers", () => {
+  it("names the virtual document used when a reviewed file is gone", () => {
+    assert.equal(CURRENT_SCHEME, "claude-current");
+  });
+
   it("hashes paths to a short stable key", () => {
     const key = pathKey("/a/b/c.ts");
     assert.equal(key.length, 16);
@@ -408,6 +413,24 @@ describe("hook peers", () => {
       folders: [a, { root: 1 }, b, null],
     });
     assert.deepEqual(parseHookPeers(mixed, a), [a, b]);
+  });
+
+  it("keeps bash:false on a non-git sibling and ignores bash:true", () => {
+    const scripts = {
+      root: "/ws/workspace",
+      stateDir: "/state/workspace",
+      bash: false as const,
+    };
+    const repo = { root: "/ws/repo-a", stateDir: "/state/a" };
+    assert.deepEqual(
+      parseHookPeers(serializeHookPeers([scripts, repo]), repo),
+      [scripts, repo]
+    );
+    const withTrue = JSON.stringify({
+      v: 1,
+      folders: [{ ...repo, bash: true }, scripts],
+    });
+    assert.deepEqual(parseHookPeers(withTrue, repo), [repo, scripts]);
   });
 
   it("unions two windows instead of letting the last one win", () => {

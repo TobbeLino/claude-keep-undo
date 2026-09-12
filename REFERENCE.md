@@ -184,9 +184,11 @@ detection is switched off.
 
 Claude Code only loads hooks from the project the session was started in. In a
 multi-root window the extension publishes `peers.json` into every folder's
-state directory, and the hook photographs **each** of those repos on a `Bash`
-call, writing into that folder's own queue. Edit/Write of a file in a sibling
-folder is captured there too, rather than dropped for being outside `--root`.
+state directory, and the hook photographs **each** Git repository on a `Bash`
+call, writing into that folder's own queue. A sibling that is not a repository
+is published with `bash: false` and skipped — it still receives Edit/Write
+files that belong under it. Edit/Write of a file in a sibling folder is
+captured there too, rather than dropped for being outside `--root`.
 
 The hook script never blocks a tool call: it swallows every error and always
 exits `0`.
@@ -227,12 +229,15 @@ it — is skipped without a snapshot. The list is deliberately tiny: a name miss
 from it costs a few milliseconds, while a name wrongly on it costs an undetected
 change.
 
-**This half needs a Git repository.** Outside one — or with Git not on the
-`PATH` — files changed by a shell command are not detected at all. Everything
-Claude changes with its ordinary edit tools is unaffected, hooks and transcript
-alike. The extension checks once per workspace and says so, with the option to
-switch the feature off, rather than leaving you to infer it from an empty review
-queue.
+**This half needs a Git repository, per folder.** A workspace folder that is
+not a repository — a sibling that only holds the `.code-workspace` file and
+workspace-global scripts — is skipped for shell-command snapshots. The hook is
+told `bash: false` for that peer and photographs the others. Edit/Write in the
+non-git folder still work. Git missing from the `PATH`, or a window whose
+*every* folder is not a repository, is the case where shell-command detection
+cannot run at all: the extension says so once, with the option to switch the
+feature off. A mixed window never offers that switch, because it would disable
+the repos that still work.
 
 Two further cases are deliberately not covered. A command run with
 `run_in_background` finishes after the hook has already sampled the filesystem,
@@ -718,11 +723,12 @@ npm run package     # npx @vscode/vsce package
 | `src/detection/transcriptEvents.ts`  | Pure: which tool calls are believed, and when                                   |
 | `src/detection/reconstruct.ts`       | Pure, verified baseline reconstruction                                          |
 | `src/detection/fileHistory.ts`       | Pure: reading Claude Code's own pre-edit copies                                 |
+| `src/detection/bashAvailability.ts`  | Pure: skip a non-git sibling, or the window cannot photograph Bash              |
 | `src/detection/bashSnapshot.ts`      | Pure: reading git status, and what a shell command changed                      |
 | `src/ui/quickDiff.ts`                | Source Control + Quick Diff provider (gutter bars, inline widget, pending list) |
 | `src/ui/commentReview.ts`            | Optional inline comment threads with Keep/Undo                                  |
 | `src/ui/codeActions.ts`              | Keep/Undo as Quick Fixes on the hunk under the cursor                           |
-| `src/ui/diffView.ts`                 | `claude-baseline:` content provider + diff opening                              |
+| `src/ui/diffView.ts`                 | `claude-baseline:` / `claude-current:` content providers + diff opening         |
 | `src/ui/fileDecorations.ts`          | Explorer badge                                                                  |
 | `src/ui/codeLens.ts`                 | Per-hunk and per-file Keep/Undo CodeLens                                        |
 | `src/ui/format.ts`                   | Shared hunk formatting helpers                                                  |

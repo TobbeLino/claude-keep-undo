@@ -42,6 +42,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   its own folder list (`peers.d/`); the hook reads the combined list, so
   opening one of those repos alone in a second window no longer disables
   capture of the others.
+- **A sibling that is not a Git repository is skipped, not fatal.** A folder
+  that only holds the `.code-workspace` file and workspace-global scripts still
+  owns Edit/Write under it, but the Bash hook does not photograph it. The other
+  folders keep shell-command detection. The warning that used to read as
+  “this window cannot detect shell changes” — and whose **Turn this off**
+  disabled `detection.bashChanges` for every folder — is now an information
+  toast for that peer only, and **Turn this off** is offered only when no
+  folder can run Git.
+- **A file Claude created and then deleted leaves the queue.** Shell `rm` never
+  opened an editor, so the review list kept a stale row whose click opened
+  “file was not found”. Tracked files are recomputed when they disappear on
+  disk. A created file that is gone is back to the pre-Claude state and is
+  dropped. A pre-existing file Claude deleted stays listed as *deleted*; Keep
+  forgets it, Undo restores it, and the diff opens against an empty virtual
+  document instead of a missing `file:` URI.
 - **Pending reviews survive a window that does not own them.** Opening the same
   folder with different siblings, or with `trackOutsideWorkspace` off, no longer
   deletes baselines that are out of this window's scope — they stay on disk and

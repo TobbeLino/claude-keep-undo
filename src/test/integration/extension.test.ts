@@ -854,6 +854,38 @@ describe("Keep / Undo for Claude Code", () => {
     assert.equal(doc.getText(), "old\n");
   });
 
+  it("drops a file Claude created once the file is gone", async () => {
+    // Claude created it (empty baseline), then deleted it — back to the
+    // pre-Claude state. The queue must not keep listing a path that opens
+    // "file was not found".
+    const file = makeFile("it-created-then-gone.txt", "brand new\n");
+    seedBaseline(file, "", /*created*/ true);
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    assert.equal(api.store.isTracked(file), true);
+
+    fs.rmSync(file, { force: true });
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    assert.equal(api.store.isTracked(file), false);
+  });
+
+  it("keeps a deleted pre-existing file reviewable against an empty right-hand side", async () => {
+    const file = makeFile("it-deleted.txt", "gone\n");
+    seedBaseline(file, "original\n");
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    assert.equal(api.store.get(file)?.missing, false);
+
+    fs.rmSync(file, { force: true });
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    const tracked = api.store.get(file);
+    assert.ok(tracked, "Undo can still restore it");
+    assert.equal(tracked.missing, true);
+
+    const doc = await vscode.workspace.openTextDocument(
+      vscode.Uri.file(file).with({ scheme: "claude-current" })
+    );
+    assert.equal(doc.getText(), "");
+  });
+
   describe("ignored files", () => {
     /** Poll until a condition holds, so a watcher's latency is not a flake. */
     async function until(

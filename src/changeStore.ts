@@ -17,6 +17,7 @@ import {
   atomicCopy,
   atomicWrite,
   BASELINE_SCHEME,
+  CURRENT_SCHEME,
   baselinesDir,
   BytesReadResult,
   locateStatePair,
@@ -1768,7 +1769,8 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
         if (
           input instanceof vscode.TabInputTextDiff &&
           input.original.scheme === BASELINE_SCHEME &&
-          input.modified.scheme === "file" &&
+          (input.modified.scheme === "file" ||
+            input.modified.scheme === CURRENT_SCHEME) &&
           input.modified.fsPath === absPath
         ) {
           stale.push(tab);

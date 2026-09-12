@@ -13,7 +13,10 @@ import { ClaudeCodeLensProvider } from "./ui/codeLens";
 import { CommentReviewController } from "./ui/commentReview";
 import {
   BASELINE_SCHEME,
+  CURRENT_SCHEME,
   BaselineContentProvider,
+  CurrentContentProvider,
+  diffModifiedUri,
   openClaudeDiff,
   toBaselineUri,
 } from "./ui/diffView";
@@ -68,11 +71,17 @@ export function activate(
 
   // --- providers -----------------------------------------------------------
   const baselineProvider = new BaselineContentProvider(hub);
+  const currentProvider = new CurrentContentProvider(hub);
   context.subscriptions.push(
     baselineProvider,
+    currentProvider,
     vscode.workspace.registerTextDocumentContentProvider(
       BASELINE_SCHEME,
       baselineProvider
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      CURRENT_SCHEME,
+      currentProvider
     )
   );
 
@@ -113,12 +122,25 @@ export function activate(
   const feedback = new Feedback(hub);
   context.subscriptions.push(feedback);
 
-  const openDiff = (absPath: string, atLine?: number) =>
-    openClaudeDiff(absPath, {
+  const openDiff = (absPath: string, atLine?: number) => {
+    const wasTracked = hub.isTracked(absPath);
+    hub.recompute(absPath);
+    const tracked = hub.get(absPath);
+    if (!tracked) {
+      void vscode.window.showInformationMessage(
+        wasTracked
+          ? `${shortName(absPath)} is no longer different from the recorded original.`
+          : "No Claude changes to review for this file."
+      );
+      return Promise.resolve();
+    }
+    return openClaudeDiff(absPath, {
       atLine,
       onOpening: () => diffLayout.notifyOpening(),
       siblings: hub.getTracked().map((f) => f.path),
+      missing: tracked.missing,
     });
+  };
 
   const reviewTarget = (arg?: unknown): ReviewStore =>
     hub.sessionFromArg(arg)?.store ?? hub;
@@ -236,12 +258,6 @@ export function activate(
       async (arg?: unknown, line?: unknown) => {
         const p = resolvePath(arg);
         if (!p) {
-          return;
-        }
-        if (!hub.isTracked(p)) {
-          void vscode.window.showInformationMessage(
-            "No Claude changes to review for this file."
-          );
           return;
         }
         await openDiff(p, typeof line === "number" ? line : undefined);
@@ -949,6 +965,9 @@ function unriskyPrompt(
  * triples.
  */
 async function openAllChanges(store: ReviewStore): Promise<void> {
+  for (const file of store.getTracked()) {
+    store.recompute(file.path);
+  }
   const tracked = store.getTracked();
   if (tracked.length === 0) {
     void vscode.window.showInformationMessage("No Claude changes to review.");
@@ -958,7 +977,7 @@ async function openAllChanges(store: ReviewStore): Promise<void> {
     (file) => [
       vscode.Uri.file(file.path),
       toBaselineUri(file.path),
-      vscode.Uri.file(file.path),
+      diffModifiedUri(file.path, file.missing),
     ]
   );
   const title = `Claude: ${pluralFiles(tracked.length)} to review`;
@@ -1121,7 +1140,11 @@ function explicitPath(arg: unknown): string | undefined {
 
 /** The real file path behind a uri, including the baseline side of our diff. */
 function trackablePath(uri: vscode.Uri): string | undefined {
-  if (uri.scheme === "file" || uri.scheme === BASELINE_SCHEME) {
+  if (
+    uri.scheme === "file" ||
+    uri.scheme === BASELINE_SCHEME ||
+    uri.scheme === CURRENT_SCHEME
+  ) {
     return uri.fsPath;
   }
   return undefined;

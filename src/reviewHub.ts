@@ -13,6 +13,7 @@ import { LineChange } from "./diff";
 import {
   hooksState,
   maybePromptInstall,
+  probeBashDetection,
   repairHooksIfStale,
   warnIfBashDetectionUnavailable,
 } from "./detection/hookInstaller";
@@ -50,12 +51,19 @@ export class FolderSession implements vscode.Disposable {
   readonly ignore: IgnoreConfig;
   readonly store: ChangeStore;
   readonly stateDir: string;
+  /**
+   * The Bash hook must not photograph this folder. Set after `git rev-parse`
+   * fails here — typically a sibling that only holds the `.code-workspace` file.
+   * Edit/Write routing is unchanged: this folder still owns the files under it.
+   */
+  skipBashPeer = false;
   private hookWatcher: KeepUndoWatcher | undefined;
   private transcript: TranscriptWatcher | undefined;
   private readonly scm: ClaudeSourceControl;
   private readonly gutterNotice: DoubledGutterNotice;
   private readonly hookWatch: vscode.Disposable;
   private readonly ignoreWatch: vscode.Disposable;
+  private readonly fileWatch: vscode.Disposable;
   private readonly storeForwarders: vscode.Disposable[] = [];
   private readonly _onDidDropIgnored = new vscode.EventEmitter<string[]>();
   readonly onDidDropIgnored = this._onDidDropIgnored.event;
@@ -84,6 +92,11 @@ export class FolderSession implements vscode.Disposable {
     this.hookWatch = watchHookSettings(folder, () =>
       this._onDidHookSettings.fire()
     );
+    this.fileWatch = watchTrackedFiles(folder, (absPath) => {
+      if (this.store.isTracked(absPath)) {
+        this.store.recompute(absPath);
+      }
+    });
     this.ignoreWatch = this.ignore.onDidChange(() => {
       const left = this.store.reconcileIgnored();
       if (left.length > 0 && !confirmedIgnore()) {
@@ -167,14 +180,6 @@ export class FolderSession implements vscode.Disposable {
           ? `Hooks detected in ${this.name}: real-time detection active.`
           : `Hooks not active in ${this.name} (${state}).`
       );
-      if (state === "ok") {
-        void warnIfBashDetectionUnavailable(
-          this.root,
-          settings.bashChanges(),
-          this.log,
-          this.context.workspaceState
-        );
-      }
     } else if (!settings.useHooks() && this.hookWatcher) {
       this.hookWatcher.dispose();
       this.hookWatcher = undefined;
@@ -207,6 +212,7 @@ export class FolderSession implements vscode.Disposable {
     this.hookWatcher?.dispose();
     this.transcript?.dispose();
     this.hookWatch.dispose();
+    this.fileWatch.dispose();
     this.ignoreWatch.dispose();
     this.gutterNotice.dispose();
     this.scm.dispose();
@@ -257,7 +263,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     });
     this.heartbeat = setInterval(() => {
       if (!this.disposed) {
-        this.publishHookPeers();
+        void this.refreshBashPeers(false);
       }
     }, HOOK_PEERS_HEARTBEAT_MS);
     this.heartbeat.unref?.();
@@ -371,6 +377,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     for (const session of this.getFolders()) {
       session.syncDetectors();
     }
+    void this.refreshBashPeers(true);
   }
 
   async promptInstallHooks(): Promise<void> {
@@ -728,7 +735,61 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     return this.getFolders().map((s) => ({
       root: s.root,
       stateDir: s.stateDir,
+      ...(s.skipBashPeer ? { bash: false as const } : {}),
     }));
+  }
+
+  /**
+   * Probe every folder, mark non-git siblings as Bash peers to skip, and tell
+   * the hook. A toast is only for the first pass (or a settings/folder change):
+   * the heartbeat re-probes so a later `git init` is picked up, without
+   * repeating the message.
+   */
+  private async refreshBashPeers(announce: boolean): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+    if (settings.bashChanges() === "off" || !settings.useHooks()) {
+      return;
+    }
+    const probes = await Promise.all(
+      this.getFolders().map(async (session) => ({
+        session,
+        problem: await probeBashDetection(session.root),
+      }))
+    );
+    if (this.disposed) {
+      return;
+    }
+    for (const { session, problem } of probes) {
+      const skip = problem !== undefined;
+      if (session.skipBashPeer !== skip && !announce) {
+        this.log(
+          skip
+            ? `skipping shell-command detection in ${session.name}: ${
+                problem === "no-git"
+                  ? "Git is not available on the PATH"
+                  : "not a Git repository"
+              }`
+            : `shell-command detection is available in ${session.name}`
+        );
+      }
+      session.skipBashPeer = skip;
+    }
+    this.publishHookPeers();
+    if (!announce) {
+      return;
+    }
+    await warnIfBashDetectionUnavailable(
+      probes.map(({ session, problem }) => ({
+        root: session.root,
+        name: session.name,
+        problem,
+      })),
+      settings.bashChanges(),
+      this.log,
+      this.context.workspaceState
+    );
   }
 
   private rehomeAcrossFolders(): boolean {
@@ -792,6 +853,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
         session.store.refreshFromDisk();
         session.syncDetectors();
       }
+      void this.refreshBashPeers(true);
       this._onDidChange.fire(undefined);
       this._onDidSessionsChange.fire();
     }
@@ -862,6 +924,36 @@ function shouldInheritWorkspaceStorage(
     return true;
   }
   return folders[0]?.uri.toString() === folder.uri.toString();
+}
+
+/**
+ * Recompute a tracked file when it changes or disappears on disk.
+ *
+ * Claude often deletes with a shell command. That never opens an editor, so
+ * the document listeners never fire, and the review queue would keep listing
+ * a file that is gone — click then opens "file was not found".
+ */
+function watchTrackedFiles(
+  folder: vscode.WorkspaceFolder,
+  onEvent: (absPath: string) => void
+): vscode.Disposable {
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(folder, "**/*")
+  );
+  const notify = (uri: vscode.Uri) => onEvent(uri.fsPath);
+  const listeners = [
+    watcher.onDidCreate(notify),
+    watcher.onDidChange(notify),
+    watcher.onDidDelete(notify),
+  ];
+  return {
+    dispose() {
+      for (const l of listeners) {
+        l.dispose();
+      }
+      watcher.dispose();
+    },
+  };
 }
 
 function watchHookSettings(

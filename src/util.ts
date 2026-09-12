@@ -200,6 +200,13 @@ export const FOLDER_IDENTITY_FILE = "folder.json";
 export interface HookPeerFolder {
   root: string;
   stateDir: string;
+  /**
+   * When `false`, the Bash hook must not photograph this folder. A sibling that
+   * is not a Git repository still owns Edit/Write files, but `git status` there
+   * cannot say what a shell command changed. Omitted means try — the hook's
+   * own `rev-parse` is the fallback for an older peers file.
+   */
+  bash?: boolean;
 }
 
 export function serializeHookPeers(folders: readonly HookPeerFolder[]): string {
@@ -242,9 +249,20 @@ export function parseHookPeersList(
       if (!item || typeof item !== "object") {
         continue;
       }
-      const rec = item as { root?: unknown; stateDir?: unknown };
+      const rec = item as {
+        root?: unknown;
+        stateDir?: unknown;
+        bash?: unknown;
+      };
       if (typeof rec.root === "string" && typeof rec.stateDir === "string") {
-        folders.push({ root: rec.root, stateDir: rec.stateDir });
+        const folder: HookPeerFolder = {
+          root: rec.root,
+          stateDir: rec.stateDir,
+        };
+        if (rec.bash === false) {
+          folder.bash = false;
+        }
+        folders.push(folder);
       }
     }
     return folders.length > 0 ? folders : undefined;
@@ -778,7 +796,9 @@ export function claudeFileHistoryDir(): string {
 //                                   cannot overwrite the combined peer list
 //   peers.json                      union of every live window's registration, for
 //                                   the hook running in one repo to capture
-//                                   the others
+//                                   the others. A folder with bash:false is
+//                                   still an Edit/Write owner, but is not
+//                                   photographed on a shell command.
 //   events.ndjson                   append-only hook event log (size-capped)
 //
 // Keyed by the folder path so the same repo keeps its review queue when opened
@@ -805,6 +825,14 @@ export function snapshotsDir(stateDir: string): string {
  * the store must not depend on the UI.
  */
 export const BASELINE_SCHEME = "claude-baseline";
+
+/**
+ * Right-hand side of a Claude diff when the file no longer exists. `file:`
+ * cannot be opened — VS Code reports "The editor could not be opened because
+ * the file was not found" — so a deleted file is shown against this empty
+ * document instead. `uri.fsPath` is still the real path.
+ */
+export const CURRENT_SCHEME = "claude-current";
 
 /** Where releases before 0.2.0 kept their state, inside the repository. */
 export function legacyStateDir(workspaceRoot: string): string {
